@@ -58,6 +58,47 @@ sudo install -m 0644 helper/com.limits_droper.helper.policy /usr/share/polkit-1/
 ```
 If you install the helper somewhere else, update the policy `exec.path` to match and export `LIMITS_HELPER_PATH`.
 
+## Install
+
+### From release
+
+1) Download the Ubuntu or Fedora tarball from the GitHub Releases page.
+2) Extract it:
+```bash
+tar -xzf Limits_droper-<version>-linux-<distro>.tar.gz
+cd Limits_droper-<version>-linux-<distro>
+```
+3) Install the helper + polkit policy (required on Wayland/COSMIC):
+```bash
+sudo install -m 0755 limits_helper /usr/local/bin/limits_helper
+sudo install -m 0644 com.limits_droper.helper.policy /usr/share/polkit-1/actions/
+```
+4) Run the GUI:
+```bash
+./limits_ui_qt
+```
+
+### From source
+
+1) Build the tools and GUI:
+```bash
+gcc -std=c11 -Wall -Wextra -O2 -o mchbar_read mchbar_read.c
+gcc -std=c11 -Wall -Wextra -O2 -o mchbar_pl_write mchbar_pl_write.c
+gcc -std=c11 -Wall -Wextra -O2 -o limits_ui limits_ui.c -lm
+gcc -std=c11 -Wall -Wextra -O2 -o limits_helper helper/limits_helper.c -lm
+cmake -S qt_ui -B qt_ui/build
+cmake --build qt_ui/build
+```
+2) Install the helper + polkit policy:
+```bash
+sudo install -m 0755 limits_helper /usr/local/bin/limits_helper
+sudo install -m 0644 helper/com.limits_droper.helper.policy /usr/share/polkit-1/actions/
+```
+3) Run the GUI:
+```bash
+./qt_ui/build/limits_ui_qt
+```
+
 ## Usage
 
 Read MCHBAR values:
