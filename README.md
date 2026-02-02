@@ -33,13 +33,12 @@ This project was made to bypass enforced power limits on a specific test setup b
 
 ## Build
 
+As a typical CMake you can just do the following
 ```bash
-gcc -std=c11 -Wall -Wextra -O2 -o mchbar_read mchbar_read.c
-gcc -std=c11 -Wall -Wextra -O2 -o mchbar_pl_write mchbar_pl_write.c
-gcc -std=c11 -Wall -Wextra -O2 -o limits_ui limits_ui.c -lm
+cmake -B build
 ```
 
-Qt UI build:
+Qt UI build only:
 ```bash
 cd qt_ui
 cmake -S . -B build
@@ -53,9 +52,11 @@ gcc -std=c11 -Wall -Wextra -O2 -o limits_helper helper/limits_helper.c -lm
 
 Install helper + polkit policy (required on Wayland/COSMIC):
 ```bash
-sudo install -m 0755 limits_helper /usr/local/bin/limits_helper
+sudo install -m 0755 build/limits_helper /usr/local/bin/limits_helper
 sudo install -m 0644 helper/com.limits_droper.helper.policy /usr/share/polkit-1/actions/
 ```
+Of course, if you use a build directory other than `build/`, you should adjust your commands appropriately.
+
 If you install the helper somewhere else, update the policy `exec.path` to match and export `LIMITS_HELPER_PATH`.
 
 ## Install
@@ -103,18 +104,18 @@ sudo install -m 0644 helper/com.limits_droper.helper.policy /usr/share/polkit-1/
 
 Read MCHBAR values:
 ```bash
-sudo ./mchbar_read
+sudo ./build/mchbar_read
 ```
 
 Write MCHBAR package limits (PL1/PL2):
 ```bash
-sudo ./mchbar_pl_write --set 150 170
-sudo ./mchbar_pl_write --restore 0x004284e800df81b8
+sudo build/mchbar_pl_write --set 150 170
+sudo build/mchbar_pl_write --restore 0x004284e800df81b8
 ```
 
 Interactive UI (read/set/sync MSR + MMIO):
 ```bash
-sudo ./limits_ui
+sudo build/limits_ui
 ```
 
 Qt UI:
