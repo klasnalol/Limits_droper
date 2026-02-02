@@ -368,14 +368,14 @@ static int apply_ratio_list(const struct cpu_list *list, uint8_t ratio) {
 
 static uint32_t oc_encode_offset_mv(double mv) {
     long raw = lround(mv * 1.024);
-    uint32_t val = (uint32_t)(raw & 0xFFFu);
+    uint32_t val = (uint32_t)(raw & 0x7FFu);
     return val << 21;
 }
 
 static double oc_decode_offset_mv(uint32_t raw) {
-    int32_t val = (int32_t)((raw >> 21) & 0xFFFu);
-    if (val & 0x800) {
-        val |= ~0xFFF;
+    int32_t val = (int32_t)((raw >> 21) & 0x7FFu);
+    if (val & 0x400) {
+        val |= ~0x7FF;
     }
     return (double)val / 1.024;
 }

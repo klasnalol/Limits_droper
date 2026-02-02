@@ -2,6 +2,7 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDoubleSpinBox>
+#include <QBoxLayout>
 #include <QFile>
 #include <QFileInfo>
 #include <QFontDatabase>
@@ -16,12 +17,15 @@
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
+#include <QResizeEvent>
+#include <QSize>
 #include <QSpinBox>
 #include <QSet>
 #include <QString>
 #include <QVBoxLayout>
 
 #include <cinttypes>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -29,6 +33,11 @@ namespace {
 
 constexpr std::uint32_t kMsrPkgPowerLimit = 0x610;
 constexpr std::uint32_t kMchbarPlOffset = 0x59A0;
+constexpr double kUvMvScale = 1.024;
+
+double quantize_uv_mv(double mv) {
+    return std::llround(mv * kUvMvScale) / kUvMvScale;
+}
 
 std::uint64_t apply_pl_units(std::uint64_t cur, std::uint16_t pl1_units, std::uint16_t pl2_units) {
     std::uint32_t lo = static_cast<std::uint32_t>(cur & 0xffffffffu);
@@ -468,21 +477,30 @@ public:
         setWindowTitle("Limits UI");
 
         auto *central = new QWidget();
-        auto *root = new QVBoxLayout();
+        auto *main_layout = new QVBoxLayout();
+        const int spacing = std::max(6, fontMetrics().height() / 2);
+        main_layout->setContentsMargins(spacing, spacing, spacing, spacing);
+        main_layout->setSpacing(spacing);
 
         auto *title = new QLabel("Limits UI (MSR 0x610 + MCHBAR 0x59A0)");
         QFont title_font = title->font();
         title_font.setPointSize(title_font.pointSize() + 2);
         title_font.setBold(true);
         title->setFont(title_font);
-        root->addWidget(title);
+        main_layout->addWidget(title);
 
         cpu_group_ = new QGroupBox("CPU info");
         auto *cpu_layout = new QFormLayout();
+        cpu_layout->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        cpu_layout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        cpu_layout->setVerticalSpacing(spacing);
+        cpu_layout->setHorizontalSpacing(spacing);
 
         cpu_vendor_ = new QLabel("-");
         cpu_model_name_ = new QLabel("-");
+        cpu_model_name_->setWordWrap(true);
         cpu_family_model_ = new QLabel("-");
+        cpu_family_model_->setWordWrap(true);
         cpu_microcode_ = new QLabel("-");
         cpu_cache_ = new QLabel("-");
         cpu_logical_ = new QLabel("-");
@@ -509,10 +527,13 @@ public:
         cpu_layout->addRow("E cores MHz", cpu_e_mhz_);
 
         cpu_group_->setLayout(cpu_layout);
-        root->addWidget(cpu_group_);
 
         status_group_ = new QGroupBox("Status");
         auto *status_layout = new QFormLayout();
+        status_layout->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        status_layout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        status_layout->setVerticalSpacing(spacing);
+        status_layout->setHorizontalSpacing(spacing);
 
         unit_label_ = new QLabel("unknown");
         status_layout->addRow("Power unit", unit_label_);
@@ -540,11 +561,21 @@ public:
         status_layout->addRow("Unknown cores", u_cpus_);
 
         status_group_->setLayout(status_layout);
-        root->addWidget(status_group_);
+
+        top_row_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
+        top_row_layout_->setSpacing(spacing);
+        top_row_layout_->addWidget(cpu_group_);
+        top_row_layout_->addWidget(status_group_);
+        main_layout->addLayout(top_row_layout_);
 
         auto *set_group = new QGroupBox("Set limits (watts)");
         auto *set_layout = new QVBoxLayout();
+        set_layout->setSpacing(spacing);
         auto *set_form = new QFormLayout();
+        set_form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        set_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        set_form->setVerticalSpacing(spacing);
+        set_form->setHorizontalSpacing(spacing);
 
         pl1_spin_ = new QDoubleSpinBox();
         pl1_spin_->setRange(1.0, 5000.0);
@@ -561,6 +592,7 @@ public:
         set_layout->addLayout(set_form);
 
         auto *set_buttons = new QHBoxLayout();
+        set_buttons->setSpacing(spacing);
         set_msr_btn_ = new QPushButton("Set MSR");
         set_mmio_btn_ = new QPushButton("Set MMIO");
         set_both_btn_ = new QPushButton("Set Both");
@@ -571,11 +603,15 @@ public:
         set_layout->addLayout(set_buttons);
 
         set_group->setLayout(set_layout);
-        root->addWidget(set_group);
 
         auto *ratio_group = new QGroupBox("CPU ratio (multiplier)");
         auto *ratio_layout = new QVBoxLayout();
+        ratio_layout->setSpacing(spacing);
         auto *ratio_form = new QFormLayout();
+        ratio_form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        ratio_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        ratio_form->setVerticalSpacing(spacing);
+        ratio_form->setHorizontalSpacing(spacing);
 
         p_ratio_spin_ = new QSpinBox();
         p_ratio_spin_->setRange(1, 255);
@@ -595,6 +631,7 @@ public:
         ratio_layout->addLayout(ratio_form);
 
         auto *ratio_buttons = new QHBoxLayout();
+        ratio_buttons->setSpacing(spacing);
         set_p_ratio_btn_ = new QPushButton("Set P");
         set_e_ratio_btn_ = new QPushButton("Set E");
         set_pe_ratio_btn_ = new QPushButton("Set P+E");
@@ -607,16 +644,22 @@ public:
         ratio_layout->addLayout(ratio_buttons);
 
         ratio_group->setLayout(ratio_layout);
-        root->addWidget(ratio_group);
 
         auto *uv_group = new QGroupBox("Voltage offset (mV)");
         auto *uv_layout = new QVBoxLayout();
+        uv_layout->setSpacing(spacing);
         auto *uv_form = new QFormLayout();
+        uv_form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        uv_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        uv_form->setVerticalSpacing(spacing);
+        uv_form->setHorizontalSpacing(spacing);
 
         core_uv_spin_ = new QDoubleSpinBox();
         core_uv_spin_->setRange(-500.0, 500.0);
-        core_uv_spin_->setDecimals(3);
+        core_uv_spin_->setDecimals(0);
         core_uv_spin_->setSingleStep(1.0);
+        core_uv_spin_->setSuffix(" mV");
+        core_uv_spin_->setToolTip("Hardware quantizes to ~0.977 mV steps.");
 
         core_uv_cur_ = new QLabel("-");
         core_uv_raw_ = new QLabel("-");
@@ -630,10 +673,23 @@ public:
         uv_layout->addWidget(core_uv_btn_);
 
         uv_group->setLayout(uv_layout);
-        root->addWidget(uv_group);
+
+        ratio_uv_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
+        ratio_uv_layout_->setSpacing(spacing);
+        ratio_uv_layout_->addWidget(uv_group);
+        ratio_uv_layout_->addWidget(ratio_group);
+        auto *ratio_uv_container = new QWidget();
+        ratio_uv_container->setLayout(ratio_uv_layout_);
+
+        mid_row_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
+        mid_row_layout_->setSpacing(spacing);
+        mid_row_layout_->addWidget(set_group);
+        mid_row_layout_->addWidget(ratio_uv_container);
+        main_layout->addLayout(mid_row_layout_);
 
         auto *sync_group = new QGroupBox("Sync + refresh");
         auto *sync_layout = new QHBoxLayout();
+        sync_layout->setSpacing(spacing);
 
         refresh_btn_ = new QPushButton("Refresh");
         sync_msr_to_mmio_btn_ = new QPushButton("MSR -> MMIO");
@@ -643,15 +699,20 @@ public:
         sync_layout->addWidget(sync_msr_to_mmio_btn_);
         sync_layout->addWidget(sync_mmio_to_msr_btn_);
         sync_group->setLayout(sync_layout);
-        root->addWidget(sync_group);
+        main_layout->addWidget(sync_group);
 
         log_ = new QPlainTextEdit();
         log_->setReadOnly(true);
         log_->setMaximumBlockCount(200);
-        root->addWidget(log_);
+        log_->setMinimumHeight(fontMetrics().height() * 6);
+        main_layout->addWidget(log_, 1);
 
-        central->setLayout(root);
+        central->setLayout(main_layout);
         setCentralWidget(central);
+        central->layout()->activate();
+        const QSize min_size = central->sizeHint().expandedTo(QSize(980, 700));
+        setMinimumSize(min_size);
+        resize(min_size);
 
         connect(refresh_btn_, &QPushButton::clicked, this, &MainWindow::refresh);
         connect(set_msr_btn_, &QPushButton::clicked, this, [this]() { apply_limits(Target::Msr); });
@@ -667,6 +728,7 @@ public:
 
         load_cpu_info();
         initialize_backend();
+        update_responsive_layout();
     }
 
 private:
@@ -712,6 +774,19 @@ private:
         e_ratio_spin_->setEnabled(enabled);
         core_uv_spin_->setEnabled(enabled);
         core_uv_btn_->setEnabled(enabled);
+    }
+
+    void update_responsive_layout() {
+        int w = width();
+        top_row_layout_->setDirection(w < 900 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+        mid_row_layout_->setDirection(w < 1100 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+        ratio_uv_layout_->setDirection(w < 800 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        QMainWindow::resizeEvent(event);
+        update_responsive_layout();
     }
 
     QLineEdit *make_readonly_line() {
@@ -861,8 +936,11 @@ private:
         cpu_e_mhz_->setText(format_mhz_stats(parse_cpu_list(state.e_cpus)));
 
         if (state.core_uv_valid) {
-            core_uv_spin_->setValue(state.core_uv_mv);
-            core_uv_cur_->setText(QString("%1 mV").arg(state.core_uv_mv, 0, 'f', 3));
+            if (!did_init_core_uv_) {
+                core_uv_spin_->setValue(state.core_uv_mv);
+                did_init_core_uv_ = true;
+            }
+            core_uv_cur_->setText(QString("%1 mV").arg(state.core_uv_mv, 0, 'f', 0));
         } else {
             core_uv_cur_->setText("-");
         }
@@ -1015,15 +1093,30 @@ private:
     void apply_core_uv() {
         QString err;
         double mv = core_uv_spin_->value();
+        double applied = quantize_uv_mv(mv);
+        QString detail;
+        if (std::fabs(applied - mv) >= 0.0005) {
+            detail = QString("Core offset target: %1 mV\nApplied (quantized): %2 mV")
+                         .arg(mv, 0, 'f', 0)
+                         .arg(applied, 0, 'f', 3);
+        } else {
+            detail = QString("Core offset target: %1 mV").arg(mv, 0, 'f', 0);
+        }
         if (!confirm_action("Set core voltage offset?",
-                            QString("Core offset target: %1 mV").arg(mv, 0, 'f', 3))) {
+                            detail)) {
             return;
         }
         if (!backend_.set_core_uv(mv, &err)) {
             show_error("Set core offset failed", err);
             return;
         }
-        log_message(QString("Set core offset %1 mV").arg(mv, 0, 'f', 3));
+        if (std::fabs(applied - mv) >= 0.0005) {
+            log_message(QString("Set core offset %1 mV (applied %2 mV)")
+                            .arg(mv, 0, 'f', 0)
+                            .arg(applied, 0, 'f', 3));
+        } else {
+            log_message(QString("Set core offset %1 mV").arg(mv, 0, 'f', 0));
+        }
         refresh();
     }
 
@@ -1090,6 +1183,7 @@ private:
     int power_unit_ = 0;
     double unit_watts_ = 0.0;
     bool did_init_limits_ = false;
+    bool did_init_core_uv_ = false;
 
     QGroupBox *cpu_group_ = nullptr;
     QLabel *cpu_vendor_ = nullptr;
@@ -1141,6 +1235,10 @@ private:
     QPushButton *sync_mmio_to_msr_btn_ = nullptr;
 
     QPlainTextEdit *log_ = nullptr;
+
+    QBoxLayout *top_row_layout_ = nullptr;
+    QBoxLayout *mid_row_layout_ = nullptr;
+    QBoxLayout *ratio_uv_layout_ = nullptr;
 };
 
 #include "main.moc"
@@ -1148,7 +1246,7 @@ private:
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
     MainWindow window;
-    window.resize(720, 600);
+    window.resize(window.minimumSize());
     window.show();
     return app.exec();
 }
