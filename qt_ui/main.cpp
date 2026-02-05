@@ -1,15 +1,23 @@
 #include <QApplication>
+#include <QBoxLayout>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDir>
 #include <QDoubleSpinBox>
-#include <QBoxLayout>
 #include <QFile>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QFormLayout>
+#include <QFrame>
+#include <QGridLayout>
 #include <QGroupBox>
-#include <QHBoxLayout>
 #include <QHash>
+#include <QHBoxLayout>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -18,11 +26,18 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QSaveFile>
+#include <QToolButton>
+#include <QSettings>
+#include <QSet>
+#include <QStyle>
 #include <QSize>
 #include <QSpinBox>
-#include <QSet>
+#include <QStandardPaths>
 #include <QString>
 #include <QVBoxLayout>
+#include <QtGlobal>
+#include <vector>
 
 #include <cinttypes>
 #include <algorithm>
@@ -34,6 +49,7 @@ namespace {
 constexpr std::uint32_t kMsrPkgPowerLimit = 0x610;
 constexpr std::uint32_t kMchbarPlOffset = 0x59A0;
 constexpr double kUvMvScale = 1.024;
+constexpr double kMinFontScale = 0.8;
 
 double quantize_uv_mv(double mv) {
     return std::llround(mv * kUvMvScale) / kUvMvScale;
@@ -269,6 +285,61 @@ struct ReadState {
 
 } // namespace
 
+class CollapsibleSection : public QFrame {
+public:
+    explicit CollapsibleSection(const QString &title, QWidget *content, int spacing, QWidget *parent = nullptr)
+        : QFrame(parent), content_(content) {
+        setFrameShape(QFrame::StyledPanel);
+        setFrameShadow(QFrame::Plain);
+
+        auto *layout = new QVBoxLayout(this);
+        layout->setContentsMargins(spacing, spacing / 2, spacing, spacing);
+        layout->setSpacing(spacing / 2);
+
+        toggle_ = new QToolButton();
+        toggle_->setCheckable(true);
+        toggle_->setChecked(true);
+        toggle_->setArrowType(Qt::DownArrow);
+        toggle_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        toggle_->setText(title);
+        toggle_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+        auto *header = new QHBoxLayout();
+        header->setSpacing(spacing / 2);
+        header->addWidget(toggle_);
+        header->addStretch();
+
+        layout->addLayout(header);
+        if (content_) {
+            layout->addWidget(content_);
+            content_->setVisible(true);
+        }
+
+        connect(toggle_, &QToolButton::toggled, this, [this](bool on) {
+            if (content_) {
+                content_->setVisible(on);
+            }
+            toggle_->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
+        });
+    }
+
+    void setExpanded(bool on) {
+        toggle_->setChecked(on);
+    }
+
+    bool isExpanded() const {
+        return toggle_->isChecked();
+    }
+
+    QToolButton *toggleButton() const {
+        return toggle_;
+    }
+
+private:
+    QToolButton *toggle_ = nullptr;
+    QWidget *content_ = nullptr;
+};
+
 class HelperBackend {
 public:
     HelperBackend() : helper_path_(resolve_helper_path()) {}
@@ -477,6 +548,7 @@ public:
         setWindowTitle("Limits UI");
 
         auto *central = new QWidget();
+        central_ = central;
         auto *main_layout = new QVBoxLayout();
         const int spacing = std::max(6, fontMetrics().height() / 2);
         main_layout->setContentsMargins(spacing, spacing, spacing, spacing);
@@ -489,12 +561,11 @@ public:
         title->setFont(title_font);
         main_layout->addWidget(title);
 
-        cpu_group_ = new QGroupBox("CPU info");
-        auto *cpu_layout = new QFormLayout();
-        cpu_layout->setRowWrapPolicy(QFormLayout::WrapLongRows);
-        cpu_layout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-        cpu_layout->setVerticalSpacing(spacing);
-        cpu_layout->setHorizontalSpacing(spacing);
+        cpu_group_ = new QGroupBox();
+        cpu_group_->setFlat(true);
+        cpu_grid_ = new QGridLayout();
+        cpu_grid_->setVerticalSpacing(spacing);
+        cpu_grid_->setHorizontalSpacing(spacing);
 
         cpu_vendor_ = new QLabel("-");
         cpu_model_name_ = new QLabel("-");
@@ -512,31 +583,37 @@ public:
         cpu_p_mhz_ = new QLabel("-");
         cpu_e_mhz_ = new QLabel("-");
 
-        cpu_layout->addRow("Vendor", cpu_vendor_);
-        cpu_layout->addRow("Model", cpu_model_name_);
-        cpu_layout->addRow("Family/Model/Stepping", cpu_family_model_);
-        cpu_layout->addRow("Microcode", cpu_microcode_);
-        cpu_layout->addRow("Cache", cpu_cache_);
-        cpu_layout->addRow("Logical CPUs", cpu_logical_);
-        cpu_layout->addRow("Physical cores", cpu_physical_);
-        cpu_layout->addRow("Packages", cpu_packages_);
-        cpu_layout->addRow("Min/Max MHz", cpu_freq_);
-        cpu_layout->addRow("P cores (detected)", cpu_p_count_);
-        cpu_layout->addRow("E cores (detected)", cpu_e_count_);
-        cpu_layout->addRow("P cores MHz", cpu_p_mhz_);
-        cpu_layout->addRow("E cores MHz", cpu_e_mhz_);
+        auto add_cpu_row = [&](const QString &label_text, QWidget *value) {
+            QLabel *label = new QLabel(label_text);
+            label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            cpu_rows_.push_back({label, value});
+        };
 
-        cpu_group_->setLayout(cpu_layout);
+        add_cpu_row("Vendor", cpu_vendor_);
+        add_cpu_row("Model", cpu_model_name_);
+        add_cpu_row("Family/Model/Stepping", cpu_family_model_);
+        add_cpu_row("Microcode", cpu_microcode_);
+        add_cpu_row("Cache", cpu_cache_);
+        add_cpu_row("Logical CPUs", cpu_logical_);
+        add_cpu_row("Physical cores", cpu_physical_);
+        add_cpu_row("Packages", cpu_packages_);
+        add_cpu_row("Min/Max MHz", cpu_freq_);
+        add_cpu_row("P cores (detected)", cpu_p_count_);
+        add_cpu_row("E cores (detected)", cpu_e_count_);
+        add_cpu_row("P cores MHz", cpu_p_mhz_);
+        add_cpu_row("E cores MHz", cpu_e_mhz_);
 
-        status_group_ = new QGroupBox("Status");
-        auto *status_layout = new QFormLayout();
-        status_layout->setRowWrapPolicy(QFormLayout::WrapLongRows);
-        status_layout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-        status_layout->setVerticalSpacing(spacing);
-        status_layout->setHorizontalSpacing(spacing);
+        layout_grid_rows(cpu_grid_, cpu_rows_, false);
+        cpu_group_->setLayout(cpu_grid_);
+        cpu_section_ = new CollapsibleSection("CPU info", cpu_group_, spacing);
+
+        status_group_ = new QGroupBox();
+        status_group_->setFlat(true);
+        status_grid_ = new QGridLayout();
+        status_grid_->setVerticalSpacing(spacing);
+        status_grid_->setHorizontalSpacing(spacing);
 
         unit_label_ = new QLabel("unknown");
-        status_layout->addRow("Power unit", unit_label_);
 
         msr_raw_ = make_readonly_line();
         mmio_raw_ = make_readonly_line();
@@ -549,26 +626,35 @@ public:
         e_cpus_ = new QLabel("-");
         u_cpus_ = new QLabel("-");
 
-        status_layout->addRow("MSR raw", msr_raw_);
-        status_layout->addRow("MSR PL1", msr_pl1_);
-        status_layout->addRow("MSR PL2", msr_pl2_);
+        auto add_status_row = [&](const QString &label_text, QWidget *value) {
+            QLabel *label = new QLabel(label_text);
+            label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            status_rows_.push_back({label, value});
+        };
 
-        status_layout->addRow("MMIO raw", mmio_raw_);
-        status_layout->addRow("MMIO PL1", mmio_pl1_);
-        status_layout->addRow("MMIO PL2", mmio_pl2_);
-        status_layout->addRow("P cores", p_cpus_);
-        status_layout->addRow("E cores", e_cpus_);
-        status_layout->addRow("Unknown cores", u_cpus_);
+        add_status_row("Power unit", unit_label_);
+        add_status_row("MSR raw", msr_raw_);
+        add_status_row("MSR PL1", msr_pl1_);
+        add_status_row("MSR PL2", msr_pl2_);
+        add_status_row("MMIO raw", mmio_raw_);
+        add_status_row("MMIO PL1", mmio_pl1_);
+        add_status_row("MMIO PL2", mmio_pl2_);
+        add_status_row("P cores", p_cpus_);
+        add_status_row("E cores", e_cpus_);
+        add_status_row("Unknown cores", u_cpus_);
 
-        status_group_->setLayout(status_layout);
+        layout_grid_rows(status_grid_, status_rows_, false);
+        status_group_->setLayout(status_grid_);
+        status_section_ = new CollapsibleSection("Status", status_group_, spacing);
 
         top_row_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
         top_row_layout_->setSpacing(spacing);
-        top_row_layout_->addWidget(cpu_group_);
-        top_row_layout_->addWidget(status_group_);
+        top_row_layout_->addWidget(cpu_section_);
+        top_row_layout_->addWidget(status_section_);
         main_layout->addLayout(top_row_layout_);
 
-        auto *set_group = new QGroupBox("Set limits (watts)");
+        set_group_ = new QGroupBox();
+        set_group_->setFlat(true);
         auto *set_layout = new QVBoxLayout();
         set_layout->setSpacing(spacing);
         auto *set_form = new QFormLayout();
@@ -602,16 +688,16 @@ public:
         set_buttons->addWidget(set_both_btn_);
         set_layout->addLayout(set_buttons);
 
-        set_group->setLayout(set_layout);
+        set_group_->setLayout(set_layout);
+        set_section_ = new CollapsibleSection("Set limits (watts)", set_group_, spacing);
 
-        auto *ratio_group = new QGroupBox("CPU ratio (multiplier)");
+        ratio_group_ = new QGroupBox();
+        ratio_group_->setFlat(true);
         auto *ratio_layout = new QVBoxLayout();
         ratio_layout->setSpacing(spacing);
-        auto *ratio_form = new QFormLayout();
-        ratio_form->setRowWrapPolicy(QFormLayout::WrapLongRows);
-        ratio_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-        ratio_form->setVerticalSpacing(spacing);
-        ratio_form->setHorizontalSpacing(spacing);
+        ratio_grid_ = new QGridLayout();
+        ratio_grid_->setVerticalSpacing(spacing);
+        ratio_grid_->setHorizontalSpacing(spacing);
 
         p_ratio_spin_ = new QSpinBox();
         p_ratio_spin_->setRange(1, 255);
@@ -624,11 +710,18 @@ public:
         p_ratio_cur_ = new QLabel("-");
         e_ratio_cur_ = new QLabel("-");
 
-        ratio_form->addRow("P-core ratio target (x)", p_ratio_spin_);
-        ratio_form->addRow("P-core ratio current", p_ratio_cur_);
-        ratio_form->addRow("E-core ratio target (x)", e_ratio_spin_);
-        ratio_form->addRow("E-core ratio current", e_ratio_cur_);
-        ratio_layout->addLayout(ratio_form);
+        auto add_ratio_row = [&](const QString &label_text, QWidget *value) {
+            QLabel *label = new QLabel(label_text);
+            label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            ratio_rows_.push_back({label, value});
+        };
+
+        add_ratio_row("P-core ratio target (x)", p_ratio_spin_);
+        add_ratio_row("P-core ratio current", p_ratio_cur_);
+        add_ratio_row("E-core ratio target (x)", e_ratio_spin_);
+        add_ratio_row("E-core ratio current", e_ratio_cur_);
+        layout_grid_rows(ratio_grid_, ratio_rows_, false);
+        ratio_layout->addLayout(ratio_grid_);
 
         auto *ratio_buttons = new QHBoxLayout();
         ratio_buttons->setSpacing(spacing);
@@ -643,16 +736,16 @@ public:
         ratio_buttons->addWidget(set_all_ratio_btn_);
         ratio_layout->addLayout(ratio_buttons);
 
-        ratio_group->setLayout(ratio_layout);
+        ratio_group_->setLayout(ratio_layout);
+        ratio_section_ = new CollapsibleSection("CPU ratio (multiplier)", ratio_group_, spacing);
 
-        auto *uv_group = new QGroupBox("Voltage offset (mV)");
+        uv_group_ = new QGroupBox();
+        uv_group_->setFlat(true);
         auto *uv_layout = new QVBoxLayout();
         uv_layout->setSpacing(spacing);
-        auto *uv_form = new QFormLayout();
-        uv_form->setRowWrapPolicy(QFormLayout::WrapLongRows);
-        uv_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-        uv_form->setVerticalSpacing(spacing);
-        uv_form->setHorizontalSpacing(spacing);
+        uv_grid_ = new QGridLayout();
+        uv_grid_->setVerticalSpacing(spacing);
+        uv_grid_->setHorizontalSpacing(spacing);
 
         core_uv_spin_ = new QDoubleSpinBox();
         core_uv_spin_->setRange(-500.0, 500.0);
@@ -664,30 +757,39 @@ public:
         core_uv_cur_ = new QLabel("-");
         core_uv_raw_ = new QLabel("-");
 
-        uv_form->addRow("Core offset target (mV)", core_uv_spin_);
-        uv_form->addRow("Core offset current", core_uv_cur_);
-        uv_form->addRow("Core offset raw", core_uv_raw_);
-        uv_layout->addLayout(uv_form);
+        auto add_uv_row = [&](const QString &label_text, QWidget *value) {
+            QLabel *label = new QLabel(label_text);
+            label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            uv_rows_.push_back({label, value});
+        };
+
+        add_uv_row("Core offset target (mV)", core_uv_spin_);
+        add_uv_row("Core offset current", core_uv_cur_);
+        add_uv_row("Core offset raw", core_uv_raw_);
+        layout_grid_rows(uv_grid_, uv_rows_, false);
+        uv_layout->addLayout(uv_grid_);
 
         core_uv_btn_ = new QPushButton("Set Core Offset");
         uv_layout->addWidget(core_uv_btn_);
 
-        uv_group->setLayout(uv_layout);
+        uv_group_->setLayout(uv_layout);
+        uv_section_ = new CollapsibleSection("Voltage offset (mV)", uv_group_, spacing);
 
         ratio_uv_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
         ratio_uv_layout_->setSpacing(spacing);
-        ratio_uv_layout_->addWidget(uv_group);
-        ratio_uv_layout_->addWidget(ratio_group);
-        auto *ratio_uv_container = new QWidget();
-        ratio_uv_container->setLayout(ratio_uv_layout_);
+        ratio_uv_layout_->addWidget(uv_section_);
+        ratio_uv_layout_->addWidget(ratio_section_);
+        ratio_uv_container_ = new QWidget();
+        ratio_uv_container_->setLayout(ratio_uv_layout_);
 
         mid_row_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
         mid_row_layout_->setSpacing(spacing);
-        mid_row_layout_->addWidget(set_group);
-        mid_row_layout_->addWidget(ratio_uv_container);
+        mid_row_layout_->addWidget(set_section_);
+        mid_row_layout_->addWidget(ratio_uv_container_);
         main_layout->addLayout(mid_row_layout_);
 
-        auto *sync_group = new QGroupBox("Sync + refresh");
+        sync_group_ = new QGroupBox();
+        sync_group_->setFlat(true);
         auto *sync_layout = new QHBoxLayout();
         sync_layout->setSpacing(spacing);
 
@@ -698,21 +800,133 @@ public:
         sync_layout->addWidget(refresh_btn_);
         sync_layout->addWidget(sync_msr_to_mmio_btn_);
         sync_layout->addWidget(sync_mmio_to_msr_btn_);
-        sync_group->setLayout(sync_layout);
-        main_layout->addWidget(sync_group);
+        sync_group_->setLayout(sync_layout);
+        sync_section_ = new CollapsibleSection("Sync + refresh", sync_group_, spacing);
+        main_layout->addWidget(sync_section_);
+
+        profile_group_ = new QGroupBox();
+        profile_group_->setFlat(true);
+        auto *profile_layout = new QVBoxLayout();
+        profile_layout->setSpacing(spacing);
+
+        profile_grid_ = new QGridLayout();
+        profile_grid_->setVerticalSpacing(spacing);
+        profile_grid_->setHorizontalSpacing(spacing);
+
+        profile_path_ = new QLineEdit();
+        profile_browse_btn_ = new QPushButton("Browse");
+        auto *profile_row = new QHBoxLayout();
+        profile_row->setSpacing(spacing);
+        profile_row->addWidget(profile_path_, 1);
+        profile_row->addWidget(profile_browse_btn_);
+        auto *profile_row_widget = new QWidget();
+        profile_row_widget->setLayout(profile_row);
+        auto add_profile_row = [&](const QString &label_text, QWidget *value) {
+            QLabel *label = new QLabel(label_text);
+            label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            profile_rows_.push_back({label, value});
+        };
+
+        add_profile_row("Profile file", profile_row_widget);
+
+        fallback_path_ = new QLineEdit();
+        fallback_browse_btn_ = new QPushButton("Browse");
+        auto *fallback_row = new QHBoxLayout();
+        fallback_row->setSpacing(spacing);
+        fallback_row->addWidget(fallback_path_, 1);
+        fallback_row->addWidget(fallback_browse_btn_);
+        auto *fallback_row_widget = new QWidget();
+        fallback_row_widget->setLayout(fallback_row);
+        add_profile_row("Fallback file", fallback_row_widget);
+
+        layout_grid_rows(profile_grid_, profile_rows_, false);
+        profile_layout->addLayout(profile_grid_);
+
+        auto *profile_buttons = new QHBoxLayout();
+        profile_buttons->setSpacing(spacing);
+        load_profile_btn_ = new QPushButton("Load Profile");
+        save_profile_btn_ = new QPushButton("Save Profile");
+        profile_buttons->addWidget(load_profile_btn_);
+        profile_buttons->addWidget(save_profile_btn_);
+        profile_layout->addLayout(profile_buttons);
+
+        startup_grid_ = new QGridLayout();
+        startup_grid_->setVerticalSpacing(spacing);
+        startup_grid_->setHorizontalSpacing(spacing);
+
+        startup_enabled_ = new QCheckBox("Apply on startup");
+        startup_use_fallback_ = new QCheckBox("Use fallback if last startup crashed");
+        startup_apply_limits_ = new QCheckBox("Apply PL1/PL2");
+        startup_limits_target_ = new QComboBox();
+        startup_limits_target_->addItems({"MSR", "MMIO", "Both"});
+        startup_apply_ratios_ = new QCheckBox("Apply ratios");
+        startup_ratio_target_ = new QComboBox();
+        startup_ratio_target_->addItems({"P", "E", "P+E", "All"});
+        startup_apply_core_uv_ = new QCheckBox("Apply core UV");
+
+        auto *limits_row = new QHBoxLayout();
+        limits_row->setSpacing(spacing);
+        limits_row->addWidget(startup_apply_limits_);
+        limits_row->addWidget(startup_limits_target_);
+        auto *limits_row_widget = new QWidget();
+        limits_row_widget->setLayout(limits_row);
+
+        auto *ratio_row = new QHBoxLayout();
+        ratio_row->setSpacing(spacing);
+        ratio_row->addWidget(startup_apply_ratios_);
+        ratio_row->addWidget(startup_ratio_target_);
+        auto *ratio_row_widget = new QWidget();
+        ratio_row_widget->setLayout(ratio_row);
+
+        auto add_startup_row = [&](const QString &label_text, QWidget *value) {
+            QLabel *label = new QLabel(label_text);
+            label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            startup_rows_.push_back({label, value});
+        };
+
+        add_startup_row("Auto-apply", startup_enabled_);
+        add_startup_row("Crash fallback", startup_use_fallback_);
+        add_startup_row("Limits", limits_row_widget);
+        add_startup_row("Ratios", ratio_row_widget);
+        add_startup_row("Core UV", startup_apply_core_uv_);
+
+        layout_grid_rows(startup_grid_, startup_rows_, false);
+        profile_layout->addLayout(startup_grid_);
+
+        profile_group_->setLayout(profile_layout);
+        profile_section_ = new CollapsibleSection("Profiles + startup", profile_group_, spacing);
+        main_layout->addWidget(profile_section_);
 
         log_ = new QPlainTextEdit();
         log_->setReadOnly(true);
         log_->setMaximumBlockCount(200);
         log_->setMinimumHeight(fontMetrics().height() * 6);
-        main_layout->addWidget(log_, 1);
+        auto *log_container = new QWidget();
+        auto *log_layout = new QVBoxLayout();
+        log_layout->setContentsMargins(0, 0, 0, 0);
+        log_layout->addWidget(log_);
+        log_container->setLayout(log_layout);
+        log_section_ = new CollapsibleSection("Log", log_container, spacing);
+        main_layout->addWidget(log_section_, 1);
+
+        // Default collapsed state: keep CPU/Status open, collapse the rest.
+        set_section_->setExpanded(false);
+        uv_section_->setExpanded(false);
+        ratio_section_->setExpanded(false);
+        sync_section_->setExpanded(false);
+        profile_section_->setExpanded(false);
+        log_section_->setExpanded(false);
 
         central->setLayout(main_layout);
         setCentralWidget(central);
         central->layout()->activate();
-        const QSize min_size = central->sizeHint().expandedTo(QSize(980, 700));
-        setMinimumSize(min_size);
-        resize(min_size);
+        const QSize hint = central->sizeHint();
+        resize(hint);
+        base_font_ = font();
+        base_height_ = height();
+        base_width_ = width();
+        update_font_scale();
+        update_minimum_size();
 
         connect(refresh_btn_, &QPushButton::clicked, this, &MainWindow::refresh);
         connect(set_msr_btn_, &QPushButton::clicked, this, [this]() { apply_limits(Target::Msr); });
@@ -725,9 +939,56 @@ public:
         connect(core_uv_btn_, &QPushButton::clicked, this, &MainWindow::apply_core_uv);
         connect(sync_msr_to_mmio_btn_, &QPushButton::clicked, this, &MainWindow::sync_msr_to_mmio);
         connect(sync_mmio_to_msr_btn_, &QPushButton::clicked, this, &MainWindow::sync_mmio_to_msr);
+        connect(load_profile_btn_, &QPushButton::clicked, this, &MainWindow::load_profile_from_disk);
+        connect(save_profile_btn_, &QPushButton::clicked, this, &MainWindow::save_profile_to_disk);
+        connect(profile_browse_btn_, &QPushButton::clicked, this, &MainWindow::browse_profile_path);
+        connect(fallback_browse_btn_, &QPushButton::clicked, this, &MainWindow::browse_fallback_path);
+
+        connect(profile_path_, &QLineEdit::textChanged, this, &MainWindow::save_preferences);
+        connect(fallback_path_, &QLineEdit::textChanged, this, &MainWindow::save_preferences);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+        connect(startup_enabled_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
+        connect(startup_use_fallback_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
+        connect(startup_apply_limits_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
+        connect(startup_apply_ratios_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
+        connect(startup_apply_core_uv_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
+#else
+        connect(startup_enabled_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
+        connect(startup_use_fallback_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
+        connect(startup_apply_limits_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
+        connect(startup_apply_ratios_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
+        connect(startup_apply_core_uv_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
+#endif
+        connect(startup_limits_target_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::save_preferences);
+        connect(startup_ratio_target_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::save_preferences);
+
+        connect(qApp, &QCoreApplication::aboutToQuit, this, &MainWindow::on_about_to_quit);
+
+        auto hook_section = [&](CollapsibleSection *section) {
+            if (!section) {
+                return;
+            }
+            auto button = section->toggleButton();
+            if (!button) {
+                return;
+            }
+            connect(button, &QToolButton::toggled, this, [this](bool) {
+                update_responsive_layout();
+            });
+        };
+        hook_section(cpu_section_);
+        hook_section(status_section_);
+        hook_section(set_section_);
+        hook_section(uv_section_);
+        hook_section(ratio_section_);
+        hook_section(sync_section_);
+        hook_section(profile_section_);
+        hook_section(log_section_);
 
         load_cpu_info();
+        load_preferences();
         initialize_backend();
+        handle_startup_apply();
         update_responsive_layout();
     }
 
@@ -750,11 +1011,26 @@ private:
         if (!backend_.helper_available(&err)) {
             QMessageBox::critical(this, "Helper missing", err);
             set_controls_enabled(false);
+            backend_ready_ = false;
             return;
         }
         set_controls_enabled(true);
+        backend_ready_ = true;
         refresh();
     }
+
+    struct Profile {
+        double pl1_w = 0.0;
+        double pl2_w = 0.0;
+        int p_ratio = 0;
+        int e_ratio = 0;
+        double core_uv_mv = 0.0;
+    };
+
+    struct Row {
+        QLabel *label = nullptr;
+        QWidget *value = nullptr;
+    };
 
     void set_controls_enabled(bool enabled) {
         status_group_->setEnabled(enabled);
@@ -778,14 +1054,644 @@ private:
 
     void update_responsive_layout() {
         int w = width();
-        top_row_layout_->setDirection(w < 900 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
-        mid_row_layout_->setDirection(w < 1100 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
-        ratio_uv_layout_->setDirection(w < 800 ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+        int h = height();
+        const int short_height = 820;
+        const int very_short_height = 720;
+        const int very_narrow = 700;
+
+        int top_min = row_min_width({cpu_section_, status_section_}, top_row_layout_);
+        int mid_min = row_min_width({set_section_, ratio_uv_container_}, mid_row_layout_);
+        int ratio_min = row_min_width({uv_section_, ratio_section_}, ratio_uv_layout_);
+
+        auto choose_dir = [&](int stack_width, int min_width) {
+            if (w < very_narrow) {
+                return QBoxLayout::TopToBottom;
+            }
+            if (h < short_height && w >= min_width) {
+                return QBoxLayout::LeftToRight;
+            }
+            return (w < std::max(stack_width, min_width)) ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight;
+        };
+
+        top_row_layout_->setDirection(choose_dir(900, top_min));
+        ratio_uv_layout_->setDirection(choose_dir(800, ratio_min));
+        mid_row_layout_->setDirection(choose_dir(1100, mid_min));
+
+        bool compact = h < short_height;
+        int cpu_w = w;
+        int status_w = w;
+        if (top_row_layout_->direction() == QBoxLayout::LeftToRight) {
+            int spacing = top_row_layout_->spacing();
+            int content = std::max(0, w - spacing);
+            cpu_w = content / 2;
+            status_w = content - cpu_w;
+        }
+        auto should_two_col = [&](int avail_w, int min_w) {
+            if (!compact) {
+                return false;
+            }
+            if (avail_w >= min_w) {
+                return true;
+            }
+            if (h < very_short_height && avail_w >= static_cast<int>(min_w * 0.75)) {
+                return true;
+            }
+            return false;
+        };
+
+        bool cpu_two_col = should_two_col(cpu_w, grid_two_col_min_width(cpu_rows_, cpu_grid_));
+        bool status_two_col = should_two_col(status_w, grid_two_col_min_width(status_rows_, status_grid_));
+        layout_grid_rows(cpu_grid_, cpu_rows_, cpu_two_col);
+        layout_grid_rows(status_grid_, status_rows_, status_two_col);
+
+        int uv_w = uv_section_ ? uv_section_->width() : w;
+        int ratio_w = ratio_section_ ? ratio_section_->width() : w;
+        bool uv_two_col = should_two_col(uv_w, grid_two_col_min_width(uv_rows_, uv_grid_));
+        bool ratio_two_col = should_two_col(ratio_w, grid_two_col_min_width(ratio_rows_, ratio_grid_));
+        layout_grid_rows(uv_grid_, uv_rows_, uv_two_col);
+        layout_grid_rows(ratio_grid_, ratio_rows_, ratio_two_col);
+
+        int profile_w = profile_section_ ? profile_section_->width() : w;
+        bool profile_two_col = should_two_col(profile_w, grid_two_col_min_width(profile_rows_, profile_grid_));
+        layout_grid_rows(profile_grid_, profile_rows_, profile_two_col);
+
+        bool startup_two_col = should_two_col(profile_w, grid_two_col_min_width(startup_rows_, startup_grid_));
+        layout_grid_rows(startup_grid_, startup_rows_, startup_two_col);
+
+        update_minimum_size();
+    }
+
+    QString config_dir() const {
+        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+        if (dir.isEmpty()) {
+            dir = QDir::homePath() + "/.config/limits_ui_qt";
+        }
+        QDir().mkpath(dir);
+        return dir;
+    }
+
+    QString guard_path() const {
+        return QDir(config_dir()).filePath("startup_guard.json");
+    }
+
+    bool write_startup_guard(const QString &profile_path, QString *err) {
+        QJsonObject obj;
+        obj["profile_path"] = profile_path;
+        obj["started_at"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+        QJsonDocument doc(obj);
+
+        QSaveFile file(guard_path());
+        if (!file.open(QIODevice::WriteOnly)) {
+            if (err) {
+                *err = QString("Failed to write guard file: %1").arg(file.errorString());
+            }
+            return false;
+        }
+        file.write(doc.toJson(QJsonDocument::Compact));
+        if (!file.commit()) {
+            if (err) {
+                *err = QString("Failed to commit guard file: %1").arg(file.errorString());
+            }
+            return false;
+        }
+        startup_guard_set_ = true;
+        return true;
+    }
+
+    bool read_startup_guard(QString *profile_path, QDateTime *started_at, QString *err) const {
+        QFile file(guard_path());
+        if (!file.exists()) {
+            return false;
+        }
+        if (!file.open(QIODevice::ReadOnly)) {
+            if (err) {
+                *err = QString("Failed to open guard file: %1").arg(file.errorString());
+            }
+            return true;
+        }
+        QJsonParseError parse_err;
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parse_err);
+        if (doc.isObject()) {
+            QJsonObject obj = doc.object();
+            if (profile_path) {
+                *profile_path = obj.value("profile_path").toString();
+            }
+            if (started_at) {
+                QString stamp = obj.value("started_at").toString();
+                *started_at = QDateTime::fromString(stamp, Qt::ISODate);
+            }
+        } else if (err) {
+            *err = QString("Invalid guard file: %1").arg(parse_err.errorString());
+        }
+        return true;
+    }
+
+    void clear_startup_guard() {
+        QFile::remove(guard_path());
+        startup_guard_set_ = false;
+    }
+
+    Profile profile_from_ui() const {
+        Profile p;
+        p.pl1_w = pl1_spin_->value();
+        p.pl2_w = pl2_spin_->value();
+        p.p_ratio = p_ratio_spin_->value();
+        p.e_ratio = e_ratio_spin_->value();
+        p.core_uv_mv = core_uv_spin_->value();
+        return p;
+    }
+
+    void apply_profile_to_ui(const Profile &p) {
+        pl1_spin_->setValue(std::clamp(p.pl1_w, pl1_spin_->minimum(), pl1_spin_->maximum()));
+        pl2_spin_->setValue(std::clamp(p.pl2_w, pl2_spin_->minimum(), pl2_spin_->maximum()));
+        p_ratio_spin_->setValue(std::clamp(p.p_ratio, p_ratio_spin_->minimum(), p_ratio_spin_->maximum()));
+        e_ratio_spin_->setValue(std::clamp(p.e_ratio, e_ratio_spin_->minimum(), e_ratio_spin_->maximum()));
+        core_uv_spin_->setValue(std::clamp(p.core_uv_mv, core_uv_spin_->minimum(), core_uv_spin_->maximum()));
+    }
+
+    bool save_profile_file(const QString &path, const Profile &p, QString *err) const {
+        if (path.trimmed().isEmpty()) {
+            if (err) {
+                *err = "Profile path is empty.";
+            }
+            return false;
+        }
+        QJsonObject obj;
+        obj["version"] = 1;
+        obj["pl1_w"] = p.pl1_w;
+        obj["pl2_w"] = p.pl2_w;
+        obj["p_ratio"] = p.p_ratio;
+        obj["e_ratio"] = p.e_ratio;
+        obj["core_uv_mv"] = p.core_uv_mv;
+        obj["saved_at"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+        QJsonDocument doc(obj);
+
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly)) {
+            if (err) {
+                *err = QString("Failed to open %1: %2").arg(path, file.errorString());
+            }
+            return false;
+        }
+        file.write(doc.toJson(QJsonDocument::Indented));
+        if (!file.commit()) {
+            if (err) {
+                *err = QString("Failed to write %1: %2").arg(path, file.errorString());
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool load_profile_file(const QString &path, Profile &p, QString *err) const {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            if (err) {
+                *err = QString("Failed to open %1: %2").arg(path, file.errorString());
+            }
+            return false;
+        }
+        QJsonParseError parse_err;
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parse_err);
+        if (!doc.isObject()) {
+            if (err) {
+                *err = QString("Invalid profile JSON: %1").arg(parse_err.errorString());
+            }
+            return false;
+        }
+        QJsonObject obj = doc.object();
+        if (obj.value("version").toInt() != 1) {
+            if (err) {
+                *err = "Unsupported profile version.";
+            }
+            return false;
+        }
+
+        auto get_double = [&](const char *key, double &out) -> bool {
+            QJsonValue v = obj.value(QLatin1String(key));
+            if (!v.isDouble()) {
+                return false;
+            }
+            out = v.toDouble();
+            return true;
+        };
+
+        auto get_int = [&](const char *key, int &out) -> bool {
+            QJsonValue v = obj.value(QLatin1String(key));
+            if (!v.isDouble()) {
+                return false;
+            }
+            double raw = v.toDouble();
+            long long rounded = std::llround(raw);
+            if (std::fabs(raw - static_cast<double>(rounded)) > 0.001) {
+                return false;
+            }
+            out = static_cast<int>(rounded);
+            return true;
+        };
+
+        double pl1_w = 0.0;
+        if (!get_double("pl1_w", pl1_w) || pl1_w <= 0.0) {
+            if (err) {
+                *err = "Invalid or missing pl1_w.";
+            }
+            return false;
+        }
+        double pl2_w = 0.0;
+        if (!get_double("pl2_w", pl2_w) || pl2_w <= 0.0) {
+            if (err) {
+                *err = "Invalid or missing pl2_w.";
+            }
+            return false;
+        }
+        int p_ratio = 0;
+        if (!get_int("p_ratio", p_ratio) || p_ratio <= 0) {
+            if (err) {
+                *err = "Invalid or missing p_ratio.";
+            }
+            return false;
+        }
+        int e_ratio = 0;
+        if (!get_int("e_ratio", e_ratio) || e_ratio <= 0) {
+            if (err) {
+                *err = "Invalid or missing e_ratio.";
+            }
+            return false;
+        }
+        double core_uv = 0.0;
+        if (!get_double("core_uv_mv", core_uv)) {
+            if (err) {
+                *err = "Invalid or missing core_uv_mv.";
+            }
+            return false;
+        }
+
+        p.pl1_w = pl1_w;
+        p.pl2_w = pl2_w;
+        p.p_ratio = p_ratio;
+        p.e_ratio = e_ratio;
+        p.core_uv_mv = core_uv;
+        return true;
+    }
+
+    void browse_profile_path() {
+        QString start_dir = QFileInfo(profile_path_->text()).absolutePath();
+        if (start_dir.isEmpty() || start_dir == ".") {
+            start_dir = config_dir();
+        }
+        QString path = QFileDialog::getOpenFileName(this, "Select profile", start_dir, "Profile (*.json);;All Files (*)");
+        if (!path.isEmpty()) {
+            profile_path_->setText(path);
+        }
+    }
+
+    void browse_fallback_path() {
+        QString start_dir = QFileInfo(fallback_path_->text()).absolutePath();
+        if (start_dir.isEmpty() || start_dir == ".") {
+            start_dir = config_dir();
+        }
+        QString path = QFileDialog::getOpenFileName(this, "Select fallback profile", start_dir, "Profile (*.json);;All Files (*)");
+        if (!path.isEmpty()) {
+            fallback_path_->setText(path);
+        }
+    }
+
+    void save_profile_to_disk() {
+        QString path = profile_path_->text().trimmed();
+        if (path.isEmpty()) {
+            QString start_dir = config_dir();
+            path = QFileDialog::getSaveFileName(this, "Save profile", start_dir, "Profile (*.json);;All Files (*)");
+            if (path.isEmpty()) {
+                return;
+            }
+            profile_path_->setText(path);
+        }
+        Profile p = profile_from_ui();
+        QString err;
+        if (!save_profile_file(path, p, &err)) {
+            show_error("Save profile failed", err);
+            return;
+        }
+        log_message(QString("Saved profile to %1").arg(path));
+    }
+
+    void load_profile_from_disk() {
+        QString path = profile_path_->text().trimmed();
+        if (path.isEmpty() || !QFileInfo::exists(path)) {
+            QString start_dir = config_dir();
+            path = QFileDialog::getOpenFileName(this, "Load profile", start_dir, "Profile (*.json);;All Files (*)");
+            if (path.isEmpty()) {
+                return;
+            }
+            profile_path_->setText(path);
+        }
+        Profile p;
+        QString err;
+        if (!load_profile_file(path, p, &err)) {
+            show_error("Load profile failed", err);
+            return;
+        }
+        apply_profile_to_ui(p);
+        log_message(QString("Loaded profile from %1").arg(path));
+    }
+
+    void load_preferences() {
+        loading_prefs_ = true;
+        QSettings settings;
+        settings.beginGroup("profiles");
+        profile_path_->setText(settings.value("profile_path").toString());
+        fallback_path_->setText(settings.value("fallback_path").toString());
+        settings.endGroup();
+
+        settings.beginGroup("startup");
+        startup_enabled_->setChecked(settings.value("enabled", false).toBool());
+        startup_use_fallback_->setChecked(settings.value("use_fallback", true).toBool());
+        startup_apply_limits_->setChecked(settings.value("apply_limits", true).toBool());
+        startup_limits_target_->setCurrentIndex(settings.value("limits_target", 2).toInt());
+        startup_apply_ratios_->setChecked(settings.value("apply_ratios", false).toBool());
+        startup_ratio_target_->setCurrentIndex(settings.value("ratio_target", 2).toInt());
+        startup_apply_core_uv_->setChecked(settings.value("apply_core_uv", false).toBool());
+        settings.endGroup();
+        loading_prefs_ = false;
+    }
+
+    void save_preferences() {
+        if (loading_prefs_) {
+            return;
+        }
+        QSettings settings;
+        settings.beginGroup("profiles");
+        settings.setValue("profile_path", profile_path_->text().trimmed());
+        settings.setValue("fallback_path", fallback_path_->text().trimmed());
+        settings.endGroup();
+
+        settings.beginGroup("startup");
+        settings.setValue("enabled", startup_enabled_->isChecked());
+        settings.setValue("use_fallback", startup_use_fallback_->isChecked());
+        settings.setValue("apply_limits", startup_apply_limits_->isChecked());
+        settings.setValue("limits_target", startup_limits_target_->currentIndex());
+        settings.setValue("apply_ratios", startup_apply_ratios_->isChecked());
+        settings.setValue("ratio_target", startup_ratio_target_->currentIndex());
+        settings.setValue("apply_core_uv", startup_apply_core_uv_->isChecked());
+        settings.endGroup();
+    }
+
+    Target startup_limits_target_value() const {
+        switch (startup_limits_target_->currentIndex()) {
+            case 0:
+                return Target::Msr;
+            case 1:
+                return Target::Mmio;
+            default:
+                return Target::Both;
+        }
+    }
+
+    RatioTarget startup_ratio_target_value() const {
+        switch (startup_ratio_target_->currentIndex()) {
+            case 0:
+                return RatioTarget::P;
+            case 1:
+                return RatioTarget::E;
+            case 2:
+                return RatioTarget::Both;
+            default:
+                return RatioTarget::All;
+        }
+    }
+
+    bool apply_limits_internal(Target target, bool confirm, bool do_refresh) {
+        QString err;
+        ReadState state;
+        if (!backend_.read_state(state, &err)) {
+            show_error("Read failed", err);
+            return false;
+        }
+        if (!update_units(state)) {
+            show_error("Invalid unit", "Power unit is unknown or zero.");
+            return false;
+        }
+
+        std::uint16_t pl1_units = 0;
+        std::uint16_t pl2_units = 0;
+        if (!build_units(state.unit_watts, pl1_units, pl2_units)) {
+            return false;
+        }
+
+        if (target == Target::Msr || target == Target::Both) {
+            std::uint64_t next = apply_pl_units(state.msr, pl1_units, pl2_units);
+            if (confirm) {
+                if (!confirm_action("Write MSR?",
+                                    QString("MSR (0x%1) new value: %2")
+                                        .arg(kMsrPkgPowerLimit, 0, 16)
+                                        .arg(hex64(next)))) {
+                    return false;
+                }
+            }
+            if (!backend_.write_msr(next, &err)) {
+                show_error("Write MSR failed", err);
+                return false;
+            }
+            log_message(QString("Wrote MSR %1").arg(hex64(next)));
+        }
+
+        if (target == Target::Mmio || target == Target::Both) {
+            std::uint64_t next = apply_pl_units(state.mmio, pl1_units, pl2_units);
+            if (confirm) {
+                if (!confirm_action("Write MMIO?",
+                                    QString("MMIO (0x%1) new value: %2")
+                                        .arg(kMchbarPlOffset, 0, 16)
+                                        .arg(hex64(next)))) {
+                    return false;
+                }
+            }
+            if (!backend_.write_mmio(next, &err)) {
+                show_error("Write MMIO failed", err);
+                return false;
+            }
+            log_message(QString("Wrote MMIO %1").arg(hex64(next)));
+        }
+
+        if (do_refresh) {
+            refresh();
+        }
+        return true;
+    }
+
+    bool apply_ratio_internal(RatioTarget target, bool confirm, bool do_refresh) {
+        QString err;
+        int p_ratio = p_ratio_spin_->value();
+        int e_ratio = e_ratio_spin_->value();
+
+        if (target == RatioTarget::P) {
+            if (confirm && !confirm_action("Set P-core ratio?",
+                                           QString("P-core ratio target: x%1").arg(p_ratio))) {
+                return false;
+            }
+            if (!backend_.set_p_ratio(p_ratio, &err)) {
+                show_error("Set P-core ratio failed", err);
+                return false;
+            }
+            log_message(QString("Set P-core ratio x%1").arg(p_ratio));
+        } else if (target == RatioTarget::E) {
+            if (confirm && !confirm_action("Set E-core ratio?",
+                                           QString("E-core ratio target: x%1").arg(e_ratio))) {
+                return false;
+            }
+            if (!backend_.set_e_ratio(e_ratio, &err)) {
+                show_error("Set E-core ratio failed", err);
+                return false;
+            }
+            log_message(QString("Set E-core ratio x%1").arg(e_ratio));
+        } else if (target == RatioTarget::Both) {
+            if (confirm && !confirm_action("Set P/E ratio?",
+                                           QString("P-core ratio x%1, E-core ratio x%2")
+                                               .arg(p_ratio)
+                                               .arg(e_ratio))) {
+                return false;
+            }
+            if (!backend_.set_pe_ratio(p_ratio, e_ratio, &err)) {
+                show_error("Set P/E ratio failed", err);
+                return false;
+            }
+            log_message(QString("Set P/E ratio x%1 / x%2").arg(p_ratio).arg(e_ratio));
+        } else {
+            int ratio = p_ratio;
+            if (confirm && !confirm_action("Set all core ratios?",
+                                           QString("All cores ratio target: x%1").arg(ratio))) {
+                return false;
+            }
+            if (!backend_.set_all_ratio(ratio, &err)) {
+                show_error("Set all ratios failed", err);
+                return false;
+            }
+            log_message(QString("Set all core ratios x%1").arg(ratio));
+        }
+
+        if (do_refresh) {
+            refresh();
+        }
+        return true;
+    }
+
+    bool apply_core_uv_internal(bool confirm, bool do_refresh) {
+        QString err;
+        double mv = core_uv_spin_->value();
+        double applied = quantize_uv_mv(mv);
+        QString detail;
+        if (std::fabs(applied - mv) >= 0.0005) {
+            detail = QString("Core offset target: %1 mV\nApplied (quantized): %2 mV")
+                         .arg(mv, 0, 'f', 0)
+                         .arg(applied, 0, 'f', 3);
+        } else {
+            detail = QString("Core offset target: %1 mV").arg(mv, 0, 'f', 0);
+        }
+        if (confirm && !confirm_action("Set core voltage offset?", detail)) {
+            return false;
+        }
+        if (!backend_.set_core_uv(mv, &err)) {
+            show_error("Set core offset failed", err);
+            return false;
+        }
+        if (std::fabs(applied - mv) >= 0.0005) {
+            log_message(QString("Set core offset %1 mV (applied %2 mV)")
+                            .arg(mv, 0, 'f', 0)
+                            .arg(applied, 0, 'f', 3));
+        } else {
+            log_message(QString("Set core offset %1 mV").arg(mv, 0, 'f', 0));
+        }
+        if (do_refresh) {
+            refresh();
+        }
+        return true;
+    }
+
+    void handle_startup_apply() {
+        if (!backend_ready_) {
+            return;
+        }
+        if (!startup_enabled_->isChecked()) {
+            return;
+        }
+
+        QString guard_profile;
+        QDateTime guard_time;
+        QString guard_err;
+        if (read_startup_guard(&guard_profile, &guard_time, &guard_err)) {
+            QString when = guard_time.isValid() ? guard_time.toLocalTime().toString("yyyy-MM-dd HH:mm:ss") : "unknown time";
+            log_message(QString("Startup guard detected (%1). Skipping auto-apply.").arg(when));
+            if (!guard_err.isEmpty()) {
+                log_message(QString("Guard warning: %1").arg(guard_err));
+            }
+            startup_enabled_->setChecked(false);
+            save_preferences();
+            if (startup_use_fallback_->isChecked() && !fallback_path_->text().trimmed().isEmpty()) {
+                Profile fallback;
+                QString err;
+                if (!load_profile_file(fallback_path_->text().trimmed(), fallback, &err)) {
+                    show_error("Fallback profile failed", err);
+                    clear_startup_guard();
+                    return;
+                }
+                apply_profile_to_ui(fallback);
+                if (!apply_startup_actions()) {
+                    clear_startup_guard();
+                    return;
+                }
+                log_message(QString("Applied fallback profile from %1").arg(fallback_path_->text().trimmed()));
+            } else {
+                show_error("Startup crash detected",
+                           "Previous auto-apply did not finish. Auto-apply has been disabled for safety.");
+            }
+            clear_startup_guard();
+            return;
+        }
+
+        QString profile_path = profile_path_->text().trimmed();
+        if (profile_path.isEmpty()) {
+            log_message("Startup enabled but no profile path set.");
+            return;
+        }
+
+        Profile profile;
+        QString err;
+        if (!load_profile_file(profile_path, profile, &err)) {
+            show_error("Startup profile failed", err);
+            return;
+        }
+        apply_profile_to_ui(profile);
+
+        if (!write_startup_guard(profile_path, &err)) {
+            log_message(QString("Warning: %1").arg(err));
+        }
+        if (!apply_startup_actions()) {
+            clear_startup_guard();
+            return;
+        }
+        log_message(QString("Applied startup profile from %1").arg(profile_path));
+    }
+
+    bool apply_startup_actions() {
+        bool ok = true;
+        if (startup_apply_limits_->isChecked()) {
+            ok = apply_limits_internal(startup_limits_target_value(), false, false);
+        }
+        if (ok && startup_apply_ratios_->isChecked()) {
+            ok = apply_ratio_internal(startup_ratio_target_value(), false, false);
+        }
+        if (ok && startup_apply_core_uv_->isChecked()) {
+            ok = apply_core_uv_internal(false, false);
+        }
+        if (ok) {
+            refresh();
+        }
+        return ok;
     }
 
 protected:
     void resizeEvent(QResizeEvent *event) override {
         QMainWindow::resizeEvent(event);
+        update_font_scale();
         update_responsive_layout();
     }
 
@@ -795,6 +1701,130 @@ protected:
         QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
         line->setFont(mono);
         return line;
+    }
+
+    int row_min_width(const std::initializer_list<QWidget *> &widgets, const QBoxLayout *layout) const {
+        int total = 0;
+        int count = 0;
+        for (QWidget *w : widgets) {
+            if (!w) {
+                continue;
+            }
+            if (!w->isVisible()) {
+                continue;
+            }
+            total += w->sizeHint().width();
+            count++;
+        }
+        if (count > 1 && layout) {
+            int spacing = layout->spacing();
+            if (spacing < 0) {
+                spacing = style()->layoutSpacing(QSizePolicy::GroupBox, QSizePolicy::GroupBox, Qt::Horizontal);
+            }
+            total += spacing * (count - 1);
+            QMargins m = layout->contentsMargins();
+            total += m.left() + m.right();
+        }
+        return total;
+    }
+
+    void update_font_scale() {
+        if (font_updating_) {
+            return;
+        }
+        if (base_height_ <= 0 || base_width_ <= 0) {
+            return;
+        }
+        const int h = height();
+        const int w = width();
+        double scale_h = static_cast<double>(h) / static_cast<double>(base_height_);
+        double scale_w = static_cast<double>(w) / static_cast<double>(base_width_);
+        double scale = std::min(scale_h, scale_w);
+        scale = std::clamp(scale, kMinFontScale, 1.0);
+        if (std::fabs(scale - font_scale_) < 0.02) {
+            return;
+        }
+        font_updating_ = true;
+        QFont f = base_font_;
+        double size = f.pointSizeF();
+        if (size <= 0.0) {
+            size = static_cast<double>(f.pointSize());
+        }
+        if (size > 0.0) {
+            f.setPointSizeF(size * scale);
+            setFont(f);
+            font_scale_ = scale;
+        }
+        font_updating_ = false;
+    }
+
+    void update_minimum_size() {
+        if (size_updating_ || !central_) {
+            return;
+        }
+        size_updating_ = true;
+        central_->layout()->activate();
+        QSize hint = central_->sizeHint();
+        QSize min_hint = central_->minimumSizeHint();
+        int min_w = std::max(hint.width(), min_hint.width());
+        int min_h = std::max(hint.height(), min_hint.height());
+        setMinimumSize(min_w, min_h);
+        size_updating_ = false;
+    }
+
+    void layout_grid_rows(QGridLayout *grid, const std::vector<Row> &rows, bool two_col) {
+        if (!grid) {
+            return;
+        }
+        int split = two_col ? static_cast<int>((rows.size() + 1) / 2) : static_cast<int>(rows.size());
+        for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+            const Row &row = rows[static_cast<size_t>(i)];
+            if (!row.label || !row.value) {
+                continue;
+            }
+            int col_group = (two_col && i >= split) ? 1 : 0;
+            int row_idx = (two_col && i >= split) ? (i - split) : i;
+            int base_col = col_group * 2;
+            grid->addWidget(row.label, row_idx, base_col);
+            grid->addWidget(row.value, row_idx, base_col + 1);
+        }
+        grid->setColumnStretch(1, 1);
+        grid->setColumnStretch(3, two_col ? 1 : 0);
+    }
+
+    int grid_two_col_min_width(const std::vector<Row> &rows, const QGridLayout *grid) const {
+        if (!grid || rows.empty()) {
+            return 0;
+        }
+        int split = static_cast<int>((rows.size() + 1) / 2);
+        int max_label_left = 0;
+        int max_value_left = 0;
+        int max_label_right = 0;
+        int max_value_right = 0;
+        for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+            const Row &row = rows[static_cast<size_t>(i)];
+            if (!row.label || !row.value) {
+                continue;
+            }
+            int label_w = row.label->sizeHint().width();
+            int value_w = row.value->sizeHint().width();
+            if (i < split) {
+                max_label_left = std::max(max_label_left, label_w);
+                max_value_left = std::max(max_value_left, value_w);
+            } else {
+                max_label_right = std::max(max_label_right, label_w);
+                max_value_right = std::max(max_value_right, value_w);
+            }
+        }
+        int spacing = grid->horizontalSpacing();
+        if (spacing < 0) {
+            spacing = style()->layoutSpacing(QSizePolicy::Label, QSizePolicy::Label, Qt::Horizontal);
+        }
+        QMargins margins = grid->contentsMargins();
+        int total = max_label_left + max_value_left + max_label_right + max_value_right;
+        total += spacing * 3;
+        total += margins.left() + margins.right();
+        return total;
     }
 
     void log_message(const QString &msg) {
@@ -987,137 +2017,15 @@ protected:
     }
 
     void apply_limits(Target target) {
-        QString err;
-        ReadState state;
-        if (!backend_.read_state(state, &err)) {
-            show_error("Read failed", err);
-            return;
-        }
-        if (!update_units(state)) {
-            show_error("Invalid unit", "Power unit is unknown or zero.");
-            return;
-        }
-
-        std::uint16_t pl1_units = 0;
-        std::uint16_t pl2_units = 0;
-        if (!build_units(state.unit_watts, pl1_units, pl2_units)) {
-            return;
-        }
-
-        if (target == Target::Msr || target == Target::Both) {
-            std::uint64_t next = apply_pl_units(state.msr, pl1_units, pl2_units);
-            if (!confirm_action("Write MSR?",
-                                QString("MSR (0x%1) new value: %2")
-                                    .arg(kMsrPkgPowerLimit, 0, 16)
-                                    .arg(hex64(next)))) {
-                return;
-            }
-            if (!backend_.write_msr(next, &err)) {
-                show_error("Write MSR failed", err);
-                return;
-            }
-            log_message(QString("Wrote MSR %1").arg(hex64(next)));
-        }
-
-        if (target == Target::Mmio || target == Target::Both) {
-            std::uint64_t next = apply_pl_units(state.mmio, pl1_units, pl2_units);
-            if (!confirm_action("Write MMIO?",
-                                QString("MMIO (0x%1) new value: %2")
-                                    .arg(kMchbarPlOffset, 0, 16)
-                                    .arg(hex64(next)))) {
-                return;
-            }
-            if (!backend_.write_mmio(next, &err)) {
-                show_error("Write MMIO failed", err);
-                return;
-            }
-            log_message(QString("Wrote MMIO %1").arg(hex64(next)));
-        }
-
-        refresh();
+        (void)apply_limits_internal(target, true, true);
     }
 
     void apply_ratio(RatioTarget target) {
-        QString err;
-        int p_ratio = p_ratio_spin_->value();
-        int e_ratio = e_ratio_spin_->value();
-
-        if (target == RatioTarget::P) {
-            if (!confirm_action("Set P-core ratio?",
-                                QString("P-core ratio target: x%1").arg(p_ratio))) {
-                return;
-            }
-            if (!backend_.set_p_ratio(p_ratio, &err)) {
-                show_error("Set P-core ratio failed", err);
-                return;
-            }
-            log_message(QString("Set P-core ratio x%1").arg(p_ratio));
-        } else if (target == RatioTarget::E) {
-            if (!confirm_action("Set E-core ratio?",
-                                QString("E-core ratio target: x%1").arg(e_ratio))) {
-                return;
-            }
-            if (!backend_.set_e_ratio(e_ratio, &err)) {
-                show_error("Set E-core ratio failed", err);
-                return;
-            }
-            log_message(QString("Set E-core ratio x%1").arg(e_ratio));
-        } else if (target == RatioTarget::Both) {
-            if (!confirm_action("Set P/E ratio?",
-                                QString("P-core ratio x%1, E-core ratio x%2")
-                                    .arg(p_ratio)
-                                    .arg(e_ratio))) {
-                return;
-            }
-            if (!backend_.set_pe_ratio(p_ratio, e_ratio, &err)) {
-                show_error("Set P/E ratio failed", err);
-                return;
-            }
-            log_message(QString("Set P/E ratio x%1 / x%2").arg(p_ratio).arg(e_ratio));
-        } else {
-            int ratio = p_ratio;
-            if (!confirm_action("Set all core ratios?",
-                                QString("All cores ratio target: x%1").arg(ratio))) {
-                return;
-            }
-            if (!backend_.set_all_ratio(ratio, &err)) {
-                show_error("Set all ratios failed", err);
-                return;
-            }
-            log_message(QString("Set all core ratios x%1").arg(ratio));
-        }
-
-        refresh();
+        (void)apply_ratio_internal(target, true, true);
     }
 
     void apply_core_uv() {
-        QString err;
-        double mv = core_uv_spin_->value();
-        double applied = quantize_uv_mv(mv);
-        QString detail;
-        if (std::fabs(applied - mv) >= 0.0005) {
-            detail = QString("Core offset target: %1 mV\nApplied (quantized): %2 mV")
-                         .arg(mv, 0, 'f', 0)
-                         .arg(applied, 0, 'f', 3);
-        } else {
-            detail = QString("Core offset target: %1 mV").arg(mv, 0, 'f', 0);
-        }
-        if (!confirm_action("Set core voltage offset?",
-                            detail)) {
-            return;
-        }
-        if (!backend_.set_core_uv(mv, &err)) {
-            show_error("Set core offset failed", err);
-            return;
-        }
-        if (std::fabs(applied - mv) >= 0.0005) {
-            log_message(QString("Set core offset %1 mV (applied %2 mV)")
-                            .arg(mv, 0, 'f', 0)
-                            .arg(applied, 0, 'f', 3));
-        } else {
-            log_message(QString("Set core offset %1 mV").arg(mv, 0, 'f', 0));
-        }
-        refresh();
+        (void)apply_core_uv_internal(true, true);
     }
 
     void sync_msr_to_mmio() {
@@ -1179,6 +2087,12 @@ protected:
         log_message(title + ": " + detail);
     }
 
+    void on_about_to_quit() {
+        if (startup_guard_set_) {
+            clear_startup_guard();
+        }
+    }
+
     HelperBackend backend_;
     int power_unit_ = 0;
     double unit_watts_ = 0.0;
@@ -1186,6 +2100,7 @@ protected:
     bool did_init_core_uv_ = false;
 
     QGroupBox *cpu_group_ = nullptr;
+    QGridLayout *cpu_grid_ = nullptr;
     QLabel *cpu_vendor_ = nullptr;
     QLabel *cpu_model_name_ = nullptr;
     QLabel *cpu_family_model_ = nullptr;
@@ -1201,6 +2116,7 @@ protected:
     QLabel *cpu_e_mhz_ = nullptr;
 
     QGroupBox *status_group_ = nullptr;
+    QGridLayout *status_grid_ = nullptr;
     QLabel *unit_label_ = nullptr;
     QLineEdit *msr_raw_ = nullptr;
     QLineEdit *mmio_raw_ = nullptr;
@@ -1234,17 +2150,70 @@ protected:
     QPushButton *sync_msr_to_mmio_btn_ = nullptr;
     QPushButton *sync_mmio_to_msr_btn_ = nullptr;
 
+    QLineEdit *profile_path_ = nullptr;
+    QPushButton *profile_browse_btn_ = nullptr;
+    QPushButton *load_profile_btn_ = nullptr;
+    QPushButton *save_profile_btn_ = nullptr;
+    QLineEdit *fallback_path_ = nullptr;
+    QPushButton *fallback_browse_btn_ = nullptr;
+    QCheckBox *startup_enabled_ = nullptr;
+    QCheckBox *startup_use_fallback_ = nullptr;
+    QCheckBox *startup_apply_limits_ = nullptr;
+    QComboBox *startup_limits_target_ = nullptr;
+    QCheckBox *startup_apply_ratios_ = nullptr;
+    QComboBox *startup_ratio_target_ = nullptr;
+    QCheckBox *startup_apply_core_uv_ = nullptr;
+
+    QGroupBox *set_group_ = nullptr;
+    CollapsibleSection *cpu_section_ = nullptr;
+    CollapsibleSection *status_section_ = nullptr;
+    CollapsibleSection *set_section_ = nullptr;
+    CollapsibleSection *ratio_section_ = nullptr;
+    CollapsibleSection *uv_section_ = nullptr;
+    CollapsibleSection *sync_section_ = nullptr;
+    CollapsibleSection *profile_section_ = nullptr;
+    CollapsibleSection *log_section_ = nullptr;
+    QGroupBox *ratio_group_ = nullptr;
+    QGroupBox *uv_group_ = nullptr;
+    QWidget *ratio_uv_container_ = nullptr;
+    QGroupBox *sync_group_ = nullptr;
+    QGroupBox *profile_group_ = nullptr;
+    QWidget *central_ = nullptr;
+
     QPlainTextEdit *log_ = nullptr;
 
     QBoxLayout *top_row_layout_ = nullptr;
     QBoxLayout *mid_row_layout_ = nullptr;
     QBoxLayout *ratio_uv_layout_ = nullptr;
+
+    std::vector<Row> cpu_rows_;
+    std::vector<Row> status_rows_;
+    QGridLayout *ratio_grid_ = nullptr;
+    QGridLayout *uv_grid_ = nullptr;
+    std::vector<Row> ratio_rows_;
+    std::vector<Row> uv_rows_;
+    QGridLayout *profile_grid_ = nullptr;
+    QGridLayout *startup_grid_ = nullptr;
+    std::vector<Row> profile_rows_;
+    std::vector<Row> startup_rows_;
+
+    bool loading_prefs_ = false;
+    bool startup_guard_set_ = false;
+    bool backend_ready_ = false;
+    bool font_updating_ = false;
+    bool size_updating_ = false;
+    double font_scale_ = 1.0;
+    int base_height_ = 0;
+    int base_width_ = 0;
+    QFont base_font_;
 };
 
 #include "main.moc"
 
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    QCoreApplication::setOrganizationName("limits_droper");
+    QCoreApplication::setApplicationName("limits_ui_qt");
     MainWindow window;
     window.resize(window.minimumSize());
     window.show();

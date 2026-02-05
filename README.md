@@ -21,6 +21,7 @@ This project was made to bypass enforced power limits on a specific test setup b
 - P-core / E-core ratio targets (IA32_PERF_CTL 0x199) with current ratio display (IA32_PERF_STATUS 0x198).
 - Core voltage offset (OC mailbox MSR 0x150, core plane).
 - Basic CPU info panel in the GUI (model, microcode, core counts, P/E MHz).
+- GUI profile save/load (JSON) with optional startup auto-apply and crash-guard fallback.
 
 ## Requirements
 
@@ -124,6 +125,9 @@ Qt UI:
 ```
 If you `cd qt_ui` first, run `./build/limits_ui_qt`.
 The GUI uses polkit via `pkexec`, so it should be run as your user (no `sudo`). You can override the helper path with `LIMITS_HELPER_PATH`.
+Profiles + startup:
+- Use "Save Profile" / "Load Profile" to store JSON profiles with PL1/PL2, ratios, and core UV.
+- Enable "Apply on startup" to auto-apply the selected profile. If the previous auto-apply did not finish (crash/lockup), startup auto-apply is disabled and an optional fallback profile can be applied instead.
 
 ## Notes
 
