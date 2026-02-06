@@ -13,11 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-#define MCHBAR_BASE 0xFEDC0000ULL
 #define MAP_SIZE    (2 * 1024 * 1024)
 #define PL_OFF      0x59A0
+
+#include "../mchbar_base.h"
 
 #define MSR_OC_MAILBOX       0x150
 #define MSR_IA32_PERF_CTL     0x199
@@ -56,15 +58,26 @@ static int open_msr(bool write) {
     return open_msr_cpu(0, write);
 }
 
-static int open_mmio(bool write, volatile uint8_t **out_base) {
+static int open_mmio(bool write, volatile uint8_t **out_base, char *err, size_t err_sz) {
+    uint64_t mchbar_base = 0;
+    if (mchbar_get_base(&mchbar_base, err, err_sz) != 0) {
+        return -1;
+    }
+
     int fd = open("/dev/mem", (write ? O_RDWR : O_RDONLY) | O_SYNC);
     if (fd < 0) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "open(/dev/mem) failed: %s", strerror(errno));
+        }
         return -1;
     }
 
     int prot = write ? (PROT_READ | PROT_WRITE) : PROT_READ;
-    void *map = mmap(NULL, MAP_SIZE, prot, MAP_SHARED, fd, MCHBAR_BASE);
+    void *map = mmap(NULL, MAP_SIZE, prot, MAP_SHARED, fd, mchbar_base);
     if (map == MAP_FAILED) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "mmap MMIO failed: %s", strerror(errno));
+        }
         close(fd);
         return -1;
     }
@@ -308,6 +321,119 @@ static int parse_double(const char *s, double *out) {
     return 1;
 }
 
+static int write_text_file(const char *path, const char *text, char *err, size_t err_sz) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "open %s failed: %s", path, strerror(errno));
+        }
+        return -1;
+    }
+    size_t len = strlen(text);
+    ssize_t n = write(fd, text, len);
+    int saved_errno = errno;
+    close(fd);
+    if (n != (ssize_t)len) {
+        if (err && err_sz) {
+            if (n < 0) {
+                snprintf(err, err_sz, "write %s failed: %s", path, strerror(saved_errno));
+            } else {
+                snprintf(err, err_sz, "short write %s (%zd bytes)", path, n);
+            }
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int write_powercap_uw(uint64_t pl1_uw, uint64_t pl2_uw, char *err, size_t err_sz) {
+    char buf[32];
+    const char *pl1_path = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw";
+    const char *pl2_path = "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw";
+
+    snprintf(buf, sizeof(buf), "%" PRIu64, pl1_uw);
+    if (write_text_file(pl1_path, buf, err, err_sz) != 0) {
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "%" PRIu64, pl2_uw);
+    if (write_text_file(pl2_path, buf, err, err_sz) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static const char *find_systemctl(void) {
+    if (access("/usr/bin/systemctl", X_OK) == 0) {
+        return "/usr/bin/systemctl";
+    }
+    if (access("/bin/systemctl", X_OK) == 0) {
+        return "/bin/systemctl";
+    }
+    return NULL;
+}
+
+static int run_systemctl_action(const char *action, bool with_now, const char *const *services, size_t count,
+                                char *err, size_t err_sz) {
+    const char *systemctl = find_systemctl();
+    if (!systemctl) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "systemctl not found");
+        }
+        return -1;
+    }
+
+    size_t argv_cap = count + (with_now ? 4 : 3);
+    const char **argv = calloc(argv_cap, sizeof(*argv));
+    if (!argv) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "alloc failed");
+        }
+        return -1;
+    }
+    size_t idx = 0;
+    argv[idx++] = systemctl;
+    argv[idx++] = action;
+    if (with_now) {
+        argv[idx++] = "--now";
+    }
+    for (size_t i = 0; i < count; i++) {
+        argv[idx++] = services[i];
+    }
+    argv[idx] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "fork failed: %s", strerror(errno));
+        }
+        free(argv);
+        return -1;
+    }
+    if (pid == 0) {
+        execv(systemctl, (char *const *)argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "waitpid failed: %s", strerror(errno));
+        }
+        free(argv);
+        return -1;
+    }
+    free(argv);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (err && err_sz) {
+            snprintf(err, err_sz, "systemctl %s failed (exit %d)", action,
+                     WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static int read_ratio_on_cpu(int cpu, uint8_t *ratio_out) {
     int fd = open_msr_cpu(cpu, false);
     if (fd < 0) {
@@ -406,12 +532,23 @@ static void usage(const char *argv0) {
         "  %s --read\n"
         "  %s --write-msr 0xHEX64\n"
         "  %s --write-mmio 0xHEX64\n"
+        "  %s --write-powercap <pl1_uw> <pl2_uw>\n"
+        "  %s --stop-thermald\n"
+        "  %s --disable-thermald\n"
+        "  %s --enable-thermald\n"
+        "  %s --stop-tuned\n"
+        "  %s --disable-tuned\n"
+        "  %s --enable-tuned\n"
+        "  %s --stop-tuned-ppd\n"
+        "  %s --disable-tuned-ppd\n"
+        "  %s --enable-tuned-ppd\n"
         "  %s --set-p-ratio <int>\n"
         "  %s --set-e-ratio <int>\n"
         "  %s --set-all-ratio <int>\n"
         "  %s --set-pe-ratio <p_int> <e_int>\n"
         "  %s --set-core-uv <mV>\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
+        argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -428,9 +565,10 @@ int main(int argc, char **argv) {
         }
 
         volatile uint8_t *mmio = NULL;
-        int mem_fd = open_mmio(false, &mmio);
+        char mmio_err[256] = {0};
+        int mem_fd = open_mmio(false, &mmio, mmio_err, sizeof(mmio_err));
         if (mem_fd < 0) {
-            fprintf(stderr, "open(/dev/mem) failed: %s\n", strerror(errno));
+            fprintf(stderr, "open MMIO failed: %s\n", mmio_err[0] ? mmio_err : "unknown error");
             close(msr_fd);
             return 1;
         }
@@ -557,6 +695,126 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (strcmp(argv[1], "--write-powercap") == 0) {
+        if (argc < 4) {
+            usage(argv[0]);
+            return 2;
+        }
+        uint64_t pl1_uw = 0;
+        uint64_t pl2_uw = 0;
+        if (!parse_u64(argv[2], &pl1_uw) || !parse_u64(argv[3], &pl2_uw) ||
+            pl1_uw == 0 || pl2_uw == 0) {
+            fprintf(stderr, "Invalid powercap values.\n");
+            return 2;
+        }
+        char err[256] = {0};
+        if (write_powercap_uw(pl1_uw, pl2_uw, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to write powercap: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--stop-thermald") == 0) {
+        const char *services[] = {"thermald.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("stop", false, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to stop thermald: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--disable-thermald") == 0) {
+        const char *services[] = {"thermald.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("disable", true, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to disable thermald: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--enable-thermald") == 0) {
+        const char *services[] = {"thermald.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("enable", true, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to enable thermald: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--stop-tuned") == 0) {
+        const char *services[] = {"tuned.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("stop", false, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to stop tuned: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--disable-tuned") == 0) {
+        const char *services[] = {"tuned.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("disable", true, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to disable tuned: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--enable-tuned") == 0) {
+        const char *services[] = {"tuned.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("enable", true, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to enable tuned: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--stop-tuned-ppd") == 0) {
+        const char *services[] = {"tuned-ppd.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("stop", false, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to stop tuned-ppd: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--disable-tuned-ppd") == 0) {
+        const char *services[] = {"tuned-ppd.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("disable", true, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to disable tuned-ppd: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--enable-tuned-ppd") == 0) {
+        const char *services[] = {"tuned-ppd.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("enable", true, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to enable tuned-ppd: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
     if (strcmp(argv[1], "--write-mmio") == 0) {
         if (argc < 3) {
             usage(argv[0]);
@@ -568,9 +826,10 @@ int main(int argc, char **argv) {
             return 2;
         }
         volatile uint8_t *mmio = NULL;
-        int mem_fd = open_mmio(true, &mmio);
+        char mmio_err[256] = {0};
+        int mem_fd = open_mmio(true, &mmio, mmio_err, sizeof(mmio_err));
         if (mem_fd < 0) {
-            fprintf(stderr, "open(/dev/mem) failed: %s\n", strerror(errno));
+            fprintf(stderr, "open MMIO failed: %s\n", mmio_err[0] ? mmio_err : "unknown error");
             return 1;
         }
         wr64(mmio, PL_OFF, val);

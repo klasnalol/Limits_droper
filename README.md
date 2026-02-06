@@ -10,6 +10,7 @@ This project was made to bypass enforced power limits on a specific test setup b
 
 - `mchbar_read.c`: read a few MCHBAR registers (including the package power limit window at 0x59A0).
 - `mchbar_pl_write.c`: write the MCHBAR package power limit register (0x59A0).
+- `mchbar_scan.c`: scan MCHBAR for PL1/PL2 patterns (useful if the PL register offset differs).
 - `limits_ui.c`: interactive CLI UI to view/set PL1/PL2 in watts and sync MSR <-> MMIO.
 - `qt_ui/`: Qt Widgets GUI with buttons for read/set/sync, ratio control, and core voltage offset.
 - `helper/`: privileged helper + polkit policy for running the Qt GUI as your user (Wayland/COSMIC friendly).
@@ -31,6 +32,9 @@ This project was made to bypass enforced power limits on a specific test setup b
 - Qt6 or Qt5 Widgets development package (for `qt_ui`).
 - Qt tools / build tools (Qt CMake tooling) for the GUI build.
 - Polkit (`pkexec`) for the Qt GUI helper on Wayland.
+
+Note on MCHBAR scanning: finding the register offset by pattern matching requires the current PL1/PL2 values. If
+you already changed limits, pass those values to `mchbar_scan` (or use `--units`) so it can match correctly.
 
 ## Build
 
@@ -86,6 +90,7 @@ sudo install -m 0644 com.limits_droper.helper.policy /usr/share/polkit-1/actions
 ```bash
 gcc -std=c11 -Wall -Wextra -O2 -o mchbar_read mchbar_read.c
 gcc -std=c11 -Wall -Wextra -O2 -o mchbar_pl_write mchbar_pl_write.c
+gcc -std=c11 -Wall -Wextra -O2 -o mchbar_scan mchbar_scan.c -lm
 gcc -std=c11 -Wall -Wextra -O2 -o limits_ui limits_ui.c -lm
 gcc -std=c11 -Wall -Wextra -O2 -o limits_helper helper/limits_helper.c -lm
 cmake -S qt_ui -B qt_ui/build
@@ -108,10 +113,45 @@ Read MCHBAR values:
 sudo ./build/mchbar_read
 ```
 
+Scan MCHBAR for PL1/PL2 pattern (default 55W/157W):
+```bash
+sudo ./build/mchbar_scan
+```
+Note: scanning relies on matching the current PL1/PL2 values. If you already changed limits, pass those values
+to `mchbar_scan` (or use `--units`) so it can find the correct register offset.
+Scan using explicit watts:
+```bash
+sudo ./build/mchbar_scan --pl1 55 --pl2 157
+```
+Scan using raw units (if you already know them):
+```bash
+sudo ./build/mchbar_scan --units 0x1b8 0x4e8
+```
+
 Write MCHBAR package limits (PL1/PL2):
 ```bash
 sudo build/mchbar_pl_write --set 150 170
 sudo build/mchbar_pl_write --restore 0x004284e800df81b8
+```
+
+Write kernel powercap limits (intel-rapl, in micro-watts):
+```bash
+sudo ./build/limits_helper --write-powercap 160000000 170000000
+```
+
+Stop/disable/enable powercap writer services:
+```bash
+sudo ./build/limits_helper --stop-thermald
+sudo ./build/limits_helper --disable-thermald
+sudo ./build/limits_helper --enable-thermald
+
+sudo ./build/limits_helper --stop-tuned
+sudo ./build/limits_helper --disable-tuned
+sudo ./build/limits_helper --enable-tuned
+
+sudo ./build/limits_helper --stop-tuned-ppd
+sudo ./build/limits_helper --disable-tuned-ppd
+sudo ./build/limits_helper --enable-tuned-ppd
 ```
 
 Interactive UI (read/set/sync MSR + MMIO):
@@ -131,7 +171,7 @@ Profiles + startup:
 
 ## Notes
 
-- MCHBAR base is assumed to be `0xFEDC0000`, package power limit register at offset `0x59A0`.
+- MCHBAR base is discovered from PCI config (host bridge 0x48), package power limit register at offset `0x59A0`.
 - MSR power unit is taken from `IA32_RAPL_POWER_UNIT` (0x606) and applied when converting watts.
 - Power limits are written to `IA32_PKG_POWER_LIMIT` (0x610) and/or MCHBAR 0x59A0.
 - Ratio targets are shown from `IA32_PERF_CTL` (0x199); current ratios are read from `IA32_PERF_STATUS` (0x198).

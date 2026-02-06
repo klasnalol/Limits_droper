@@ -382,6 +382,46 @@ public:
         return run_simple({"--write-mmio", hex64(val)}, err);
     }
 
+    bool write_powercap(std::uint64_t pl1_uw, std::uint64_t pl2_uw, QString *err) const {
+        return run_simple({"--write-powercap", QString::number(pl1_uw), QString::number(pl2_uw)}, err);
+    }
+
+    bool stop_thermald(QString *err) const {
+        return run_simple({"--stop-thermald"}, err);
+    }
+
+    bool disable_thermald(QString *err) const {
+        return run_simple({"--disable-thermald"}, err);
+    }
+
+    bool enable_thermald(QString *err) const {
+        return run_simple({"--enable-thermald"}, err);
+    }
+
+    bool stop_tuned(QString *err) const {
+        return run_simple({"--stop-tuned"}, err);
+    }
+
+    bool disable_tuned(QString *err) const {
+        return run_simple({"--disable-tuned"}, err);
+    }
+
+    bool enable_tuned(QString *err) const {
+        return run_simple({"--enable-tuned"}, err);
+    }
+
+    bool stop_tuned_ppd(QString *err) const {
+        return run_simple({"--stop-tuned-ppd"}, err);
+    }
+
+    bool disable_tuned_ppd(QString *err) const {
+        return run_simple({"--disable-tuned-ppd"}, err);
+    }
+
+    bool enable_tuned_ppd(QString *err) const {
+        return run_simple({"--enable-tuned-ppd"}, err);
+    }
+
     bool set_p_ratio(int ratio, QString *err) const {
         return run_simple({"--set-p-ratio", QString::number(ratio)}, err);
     }
@@ -688,6 +728,10 @@ public:
         set_buttons->addWidget(set_both_btn_);
         set_layout->addLayout(set_buttons);
 
+        powercap_check_ = new QCheckBox("Also set kernel powercap (intel-rapl)");
+        powercap_check_->setChecked(true);
+        set_layout->addWidget(powercap_check_);
+
         set_group_->setLayout(set_layout);
         set_section_ = new CollapsibleSection("Set limits (watts)", set_group_, spacing);
 
@@ -796,10 +840,28 @@ public:
         refresh_btn_ = new QPushButton("Refresh");
         sync_msr_to_mmio_btn_ = new QPushButton("MSR -> MMIO");
         sync_mmio_to_msr_btn_ = new QPushButton("MMIO -> MSR");
+        stop_thermald_btn_ = new QPushButton("Stop thermald");
+        disable_thermald_btn_ = new QPushButton("Disable thermald");
+        enable_thermald_btn_ = new QPushButton("Enable thermald");
+        stop_tuned_btn_ = new QPushButton("Stop tuned");
+        disable_tuned_btn_ = new QPushButton("Disable tuned");
+        enable_tuned_btn_ = new QPushButton("Enable tuned");
+        stop_tuned_ppd_btn_ = new QPushButton("Stop tuned-ppd");
+        disable_tuned_ppd_btn_ = new QPushButton("Disable tuned-ppd");
+        enable_tuned_ppd_btn_ = new QPushButton("Enable tuned-ppd");
 
         sync_layout->addWidget(refresh_btn_);
         sync_layout->addWidget(sync_msr_to_mmio_btn_);
         sync_layout->addWidget(sync_mmio_to_msr_btn_);
+        sync_layout->addWidget(stop_thermald_btn_);
+        sync_layout->addWidget(disable_thermald_btn_);
+        sync_layout->addWidget(enable_thermald_btn_);
+        sync_layout->addWidget(stop_tuned_btn_);
+        sync_layout->addWidget(disable_tuned_btn_);
+        sync_layout->addWidget(enable_tuned_btn_);
+        sync_layout->addWidget(stop_tuned_ppd_btn_);
+        sync_layout->addWidget(disable_tuned_ppd_btn_);
+        sync_layout->addWidget(enable_tuned_ppd_btn_);
         sync_group_->setLayout(sync_layout);
         sync_section_ = new CollapsibleSection("Sync + refresh", sync_group_, spacing);
         main_layout->addWidget(sync_section_);
@@ -939,6 +1001,15 @@ public:
         connect(core_uv_btn_, &QPushButton::clicked, this, &MainWindow::apply_core_uv);
         connect(sync_msr_to_mmio_btn_, &QPushButton::clicked, this, &MainWindow::sync_msr_to_mmio);
         connect(sync_mmio_to_msr_btn_, &QPushButton::clicked, this, &MainWindow::sync_mmio_to_msr);
+        connect(stop_thermald_btn_, &QPushButton::clicked, this, &MainWindow::stop_thermald);
+        connect(disable_thermald_btn_, &QPushButton::clicked, this, &MainWindow::disable_thermald);
+        connect(enable_thermald_btn_, &QPushButton::clicked, this, &MainWindow::enable_thermald);
+        connect(stop_tuned_btn_, &QPushButton::clicked, this, &MainWindow::stop_tuned);
+        connect(disable_tuned_btn_, &QPushButton::clicked, this, &MainWindow::disable_tuned);
+        connect(enable_tuned_btn_, &QPushButton::clicked, this, &MainWindow::enable_tuned);
+        connect(stop_tuned_ppd_btn_, &QPushButton::clicked, this, &MainWindow::stop_tuned_ppd);
+        connect(disable_tuned_ppd_btn_, &QPushButton::clicked, this, &MainWindow::disable_tuned_ppd);
+        connect(enable_tuned_ppd_btn_, &QPushButton::clicked, this, &MainWindow::enable_tuned_ppd);
         connect(load_profile_btn_, &QPushButton::clicked, this, &MainWindow::load_profile_from_disk);
         connect(save_profile_btn_, &QPushButton::clicked, this, &MainWindow::save_profile_to_disk);
         connect(profile_browse_btn_, &QPushButton::clicked, this, &MainWindow::browse_profile_path);
@@ -952,12 +1023,14 @@ public:
         connect(startup_apply_limits_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_ratios_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_core_uv_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
+        connect(powercap_check_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
 #else
         connect(startup_enabled_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
         connect(startup_use_fallback_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_limits_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_ratios_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_core_uv_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
+        connect(powercap_check_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
 #endif
         connect(startup_limits_target_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::save_preferences);
         connect(startup_ratio_target_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::save_preferences);
@@ -1044,8 +1117,18 @@ private:
         refresh_btn_->setEnabled(enabled);
         sync_msr_to_mmio_btn_->setEnabled(enabled);
         sync_mmio_to_msr_btn_->setEnabled(enabled);
+        stop_thermald_btn_->setEnabled(enabled);
+        disable_thermald_btn_->setEnabled(enabled);
+        enable_thermald_btn_->setEnabled(enabled);
+        stop_tuned_btn_->setEnabled(enabled);
+        disable_tuned_btn_->setEnabled(enabled);
+        enable_tuned_btn_->setEnabled(enabled);
+        stop_tuned_ppd_btn_->setEnabled(enabled);
+        disable_tuned_ppd_btn_->setEnabled(enabled);
+        enable_tuned_ppd_btn_->setEnabled(enabled);
         pl1_spin_->setEnabled(enabled);
         pl2_spin_->setEnabled(enabled);
+        powercap_check_->setEnabled(enabled);
         p_ratio_spin_->setEnabled(enabled);
         e_ratio_spin_->setEnabled(enabled);
         core_uv_spin_->setEnabled(enabled);
@@ -1403,6 +1486,10 @@ private:
         fallback_path_->setText(settings.value("fallback_path").toString());
         settings.endGroup();
 
+        settings.beginGroup("limits");
+        powercap_check_->setChecked(settings.value("apply_powercap", true).toBool());
+        settings.endGroup();
+
         settings.beginGroup("startup");
         startup_enabled_->setChecked(settings.value("enabled", false).toBool());
         startup_use_fallback_->setChecked(settings.value("use_fallback", true).toBool());
@@ -1423,6 +1510,10 @@ private:
         settings.beginGroup("profiles");
         settings.setValue("profile_path", profile_path_->text().trimmed());
         settings.setValue("fallback_path", fallback_path_->text().trimmed());
+        settings.endGroup();
+
+        settings.beginGroup("limits");
+        settings.setValue("apply_powercap", powercap_check_->isChecked());
         settings.endGroup();
 
         settings.beginGroup("startup");
@@ -1478,6 +1569,9 @@ private:
             return false;
         }
 
+        double pl1_w = pl1_spin_->value();
+        double pl2_w = pl2_spin_->value();
+
         if (target == Target::Msr || target == Target::Both) {
             std::uint64_t next = apply_pl_units(state.msr, pl1_units, pl2_units);
             if (confirm) {
@@ -1510,6 +1604,32 @@ private:
                 return false;
             }
             log_message(QString("Wrote MMIO %1").arg(hex64(next)));
+        }
+
+        if (powercap_check_ && powercap_check_->isChecked()) {
+            std::uint64_t pl1_uw = static_cast<std::uint64_t>(std::llround(pl1_w * 1000000.0));
+            std::uint64_t pl2_uw = static_cast<std::uint64_t>(std::llround(pl2_w * 1000000.0));
+            if (pl1_uw == 0 || pl2_uw == 0) {
+                show_error("Invalid values", "Kernel powercap values must be non-zero.");
+                return false;
+            }
+            if (confirm) {
+                if (!confirm_action("Write kernel powercap?",
+                                    QString("PL1: %1 W (%2 uW)\nPL2: %3 W (%4 uW)")
+                                        .arg(pl1_w, 0, 'f', 2)
+                                        .arg(pl1_uw)
+                                        .arg(pl2_w, 0, 'f', 2)
+                                        .arg(pl2_uw))) {
+                    return false;
+                }
+            }
+            if (!backend_.write_powercap(pl1_uw, pl2_uw, &err)) {
+                show_error("Write powercap failed", err);
+                return false;
+            }
+            log_message(QString("Wrote kernel powercap PL1=%1W PL2=%2W")
+                            .arg(pl1_w, 0, 'f', 2)
+                            .arg(pl2_w, 0, 'f', 2));
         }
 
         if (do_refresh) {
@@ -2072,6 +2192,126 @@ protected:
         refresh();
     }
 
+    void stop_thermald() {
+        QString detail = "This will stop thermald.";
+        if (!confirm_action("Stop thermald?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.stop_thermald(&err)) {
+            show_error("Stop thermald failed", err);
+            return;
+        }
+        log_message("Stopped thermald.");
+    }
+
+    void disable_thermald() {
+        QString detail = "This will disable thermald and stop it now.\n"
+                         "Changes persist across reboots.";
+        if (!confirm_action("Disable thermald?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.disable_thermald(&err)) {
+            show_error("Disable thermald failed", err);
+            return;
+        }
+        log_message("Disabled thermald.");
+    }
+
+    void enable_thermald() {
+        QString detail = "This will enable thermald and start it now.";
+        if (!confirm_action("Enable thermald?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.enable_thermald(&err)) {
+            show_error("Enable thermald failed", err);
+            return;
+        }
+        log_message("Enabled thermald.");
+    }
+
+    void stop_tuned() {
+        QString detail = "This will stop tuned.";
+        if (!confirm_action("Stop tuned?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.stop_tuned(&err)) {
+            show_error("Stop tuned failed", err);
+            return;
+        }
+        log_message("Stopped tuned.");
+    }
+
+    void disable_tuned() {
+        QString detail = "This will disable tuned and stop it now.\n"
+                         "Changes persist across reboots.";
+        if (!confirm_action("Disable tuned?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.disable_tuned(&err)) {
+            show_error("Disable tuned failed", err);
+            return;
+        }
+        log_message("Disabled tuned.");
+    }
+
+    void enable_tuned() {
+        QString detail = "This will enable tuned and start it now.";
+        if (!confirm_action("Enable tuned?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.enable_tuned(&err)) {
+            show_error("Enable tuned failed", err);
+            return;
+        }
+        log_message("Enabled tuned.");
+    }
+
+    void stop_tuned_ppd() {
+        QString detail = "This will stop tuned-ppd.";
+        if (!confirm_action("Stop tuned-ppd?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.stop_tuned_ppd(&err)) {
+            show_error("Stop tuned-ppd failed", err);
+            return;
+        }
+        log_message("Stopped tuned-ppd.");
+    }
+
+    void disable_tuned_ppd() {
+        QString detail = "This will disable tuned-ppd and stop it now.\n"
+                         "Changes persist across reboots.";
+        if (!confirm_action("Disable tuned-ppd?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.disable_tuned_ppd(&err)) {
+            show_error("Disable tuned-ppd failed", err);
+            return;
+        }
+        log_message("Disabled tuned-ppd.");
+    }
+
+    void enable_tuned_ppd() {
+        QString detail = "This will enable tuned-ppd and start it now.";
+        if (!confirm_action("Enable tuned-ppd?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.enable_tuned_ppd(&err)) {
+            show_error("Enable tuned-ppd failed", err);
+            return;
+        }
+        log_message("Enabled tuned-ppd.");
+    }
+
     bool confirm_action(const QString &title, const QString &detail) {
         QMessageBox box(this);
         box.setWindowTitle(title);
@@ -2130,6 +2370,7 @@ protected:
 
     QDoubleSpinBox *pl1_spin_ = nullptr;
     QDoubleSpinBox *pl2_spin_ = nullptr;
+    QCheckBox *powercap_check_ = nullptr;
     QSpinBox *p_ratio_spin_ = nullptr;
     QSpinBox *e_ratio_spin_ = nullptr;
     QLabel *p_ratio_cur_ = nullptr;
@@ -2149,6 +2390,15 @@ protected:
     QPushButton *core_uv_btn_ = nullptr;
     QPushButton *sync_msr_to_mmio_btn_ = nullptr;
     QPushButton *sync_mmio_to_msr_btn_ = nullptr;
+    QPushButton *stop_thermald_btn_ = nullptr;
+    QPushButton *disable_thermald_btn_ = nullptr;
+    QPushButton *enable_thermald_btn_ = nullptr;
+    QPushButton *stop_tuned_btn_ = nullptr;
+    QPushButton *disable_tuned_btn_ = nullptr;
+    QPushButton *enable_tuned_btn_ = nullptr;
+    QPushButton *stop_tuned_ppd_btn_ = nullptr;
+    QPushButton *disable_tuned_ppd_btn_ = nullptr;
+    QPushButton *enable_tuned_ppd_btn_ = nullptr;
 
     QLineEdit *profile_path_ = nullptr;
     QPushButton *profile_browse_btn_ = nullptr;

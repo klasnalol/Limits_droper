@@ -11,9 +11,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define MCHBAR_BASE 0xFEDC0000ULL
 #define MAP_SIZE    (2 * 1024 * 1024)
 #define PL_OFF      0x59A0
+
+#include "mchbar_base.h"
 
 #define MSR_RAPL_POWER_UNIT  0x606
 #define MSR_PKG_POWER_LIMIT  0x610
@@ -37,14 +38,53 @@ static void wr64(volatile uint8_t *base, uint32_t off, uint64_t v) {
     (void)p32[1];
 }
 
+static int write_text_file(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    size_t len = strlen(text);
+    ssize_t n = write(fd, text, len);
+    int saved_errno = errno;
+    close(fd);
+    if (n != (ssize_t)len) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int write_powercap_uw(uint64_t pl1_uw, uint64_t pl2_uw) {
+    char buf[32];
+    const char *pl1_path = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw";
+    const char *pl2_path = "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw";
+
+    snprintf(buf, sizeof(buf), "%" PRIu64, pl1_uw);
+    if (write_text_file(pl1_path, buf) != 0) {
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "%" PRIu64, pl2_uw);
+    if (write_text_file(pl2_path, buf) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int open_mmio(struct mmio_ctx *ctx) {
+    uint64_t mchbar_base = 0;
+    char err[256] = {0};
+    if (mchbar_get_base(&mchbar_base, err, sizeof(err)) != 0) {
+        fprintf(stderr, "MCHBAR base discovery failed: %s\n", err[0] ? err : "unknown error");
+        return -1;
+    }
+
     ctx->fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (ctx->fd < 0) {
         perror("open(/dev/mem)");
         return -1;
     }
 
-    ctx->base = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fd, MCHBAR_BASE);
+    ctx->base = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fd, mchbar_base);
     if (ctx->base == MAP_FAILED) {
         perror("mmap");
         close(ctx->fd);
@@ -264,6 +304,20 @@ static int set_limits(int msr_fd, struct mmio_ctx *mmio, double unit_watts) {
         if (confirm("Write MMIO?")) {
             wr64(mmio->base, PL_OFF, next);
         }
+    }
+
+    if (confirm("Write kernel powercap (intel-rapl)?")) {
+        uint64_t pl1_uw = (uint64_t)llround(pl1_w * 1000000.0);
+        uint64_t pl2_uw = (uint64_t)llround(pl2_w * 1000000.0);
+        if (pl1_uw == 0 || pl2_uw == 0) {
+            fprintf(stderr, "Invalid powercap values.\n");
+            return -1;
+        }
+        if (write_powercap_uw(pl1_uw, pl2_uw) != 0) {
+            fprintf(stderr, "write powercap failed: %s\n", strerror(errno));
+            return -1;
+        }
+        printf("Wrote powercap PL1=%" PRIu64 "uW PL2=%" PRIu64 "uW\n", pl1_uw, pl2_uw);
     }
 
     return 0;

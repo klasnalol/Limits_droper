@@ -5,8 +5,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define MCHBAR_BASE 0xFEDC0000ULL
 #define MAP_SIZE    (2 * 1024 * 1024)   // 2MB is enough for offsets like 0x59A0 safely
+
+#include "mchbar_base.h"
 
 static uint64_t rd64(volatile uint8_t *base, uint32_t off) {
     volatile uint32_t *p32 = (volatile uint32_t *)(base + off);
@@ -19,7 +20,15 @@ int main(void) {
     int fd = open("/dev/mem", O_RDONLY | O_SYNC);
     if (fd < 0) { perror("open(/dev/mem)"); return 1; }
 
-    volatile uint8_t *mmio = mmap(NULL, MAP_SIZE, PROT_READ, MAP_SHARED, fd, MCHBAR_BASE);
+    uint64_t mchbar_base = 0;
+    char err[256] = {0};
+    if (mchbar_get_base(&mchbar_base, err, sizeof(err)) != 0) {
+        fprintf(stderr, "MCHBAR base discovery failed: %s\n", err[0] ? err : "unknown error");
+        close(fd);
+        return 1;
+    }
+
+    volatile uint8_t *mmio = mmap(NULL, MAP_SIZE, PROT_READ, MAP_SHARED, fd, mchbar_base);
     if (mmio == MAP_FAILED) { perror("mmap"); return 1; }
 
     struct { const char *name; uint32_t off; } regs[] = {

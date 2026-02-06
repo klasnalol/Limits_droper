@@ -8,9 +8,10 @@
 #include <string.h>
 #include <errno.h>
 
-#define MCHBAR_BASE 0xFEDC0000ULL
 #define MAP_SIZE    (2 * 1024 * 1024)
 #define PL_OFF      0x59A0
+
+#include "mchbar_base.h"
 
 static uint64_t rd64(volatile uint8_t *base, uint32_t off) {
     volatile uint32_t *p32 = (volatile uint32_t *)(base + off);
@@ -50,7 +51,15 @@ int main(int argc, char **argv) {
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0) { perror("open(/dev/mem)"); return 1; }
 
-    volatile uint8_t *mmio = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, MCHBAR_BASE);
+    uint64_t mchbar_base = 0;
+    char err[256] = {0};
+    if (mchbar_get_base(&mchbar_base, err, sizeof(err)) != 0) {
+        fprintf(stderr, "MCHBAR base discovery failed: %s\n", err[0] ? err : "unknown error");
+        close(fd);
+        return 1;
+    }
+
+    volatile uint8_t *mmio = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mchbar_base);
     if (mmio == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
 
     uint64_t orig = rd64(mmio, PL_OFF);
