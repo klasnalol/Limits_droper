@@ -27,6 +27,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSaveFile>
+#include <QScrollArea>
 #include <QToolButton>
 #include <QSettings>
 #include <QSet>
@@ -386,6 +387,10 @@ public:
         return run_simple({"--write-powercap", QString::number(pl1_uw), QString::number(pl2_uw)}, err);
     }
 
+    bool start_thermald(QString *err) const {
+        return run_simple({"--start-thermald"}, err);
+    }
+
     bool stop_thermald(QString *err) const {
         return run_simple({"--stop-thermald"}, err);
     }
@@ -398,6 +403,10 @@ public:
         return run_simple({"--enable-thermald"}, err);
     }
 
+    bool start_tuned(QString *err) const {
+        return run_simple({"--start-tuned"}, err);
+    }
+
     bool stop_tuned(QString *err) const {
         return run_simple({"--stop-tuned"}, err);
     }
@@ -408,6 +417,10 @@ public:
 
     bool enable_tuned(QString *err) const {
         return run_simple({"--enable-tuned"}, err);
+    }
+
+    bool start_tuned_ppd(QString *err) const {
+        return run_simple({"--start-tuned-ppd"}, err);
     }
 
     bool stop_tuned_ppd(QString *err) const {
@@ -834,37 +847,65 @@ public:
 
         sync_group_ = new QGroupBox();
         sync_group_->setFlat(true);
-        auto *sync_layout = new QHBoxLayout();
+        auto *sync_layout = new QVBoxLayout();
         sync_layout->setSpacing(spacing);
 
+        sync_buttons_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
+        sync_buttons_layout_->setSpacing(spacing);
         refresh_btn_ = new QPushButton("Refresh");
         sync_msr_to_mmio_btn_ = new QPushButton("MSR -> MMIO");
         sync_mmio_to_msr_btn_ = new QPushButton("MMIO -> MSR");
-        stop_thermald_btn_ = new QPushButton("Stop thermald");
-        disable_thermald_btn_ = new QPushButton("Disable thermald");
-        enable_thermald_btn_ = new QPushButton("Enable thermald");
-        stop_tuned_btn_ = new QPushButton("Stop tuned");
-        disable_tuned_btn_ = new QPushButton("Disable tuned");
-        enable_tuned_btn_ = new QPushButton("Enable tuned");
-        stop_tuned_ppd_btn_ = new QPushButton("Stop tuned-ppd");
-        disable_tuned_ppd_btn_ = new QPushButton("Disable tuned-ppd");
-        enable_tuned_ppd_btn_ = new QPushButton("Enable tuned-ppd");
+        sync_buttons_layout_->addWidget(refresh_btn_);
+        sync_buttons_layout_->addWidget(sync_msr_to_mmio_btn_);
+        sync_buttons_layout_->addWidget(sync_mmio_to_msr_btn_);
+        sync_layout->addLayout(sync_buttons_layout_);
 
-        sync_layout->addWidget(refresh_btn_);
-        sync_layout->addWidget(sync_msr_to_mmio_btn_);
-        sync_layout->addWidget(sync_mmio_to_msr_btn_);
-        sync_layout->addWidget(stop_thermald_btn_);
-        sync_layout->addWidget(disable_thermald_btn_);
-        sync_layout->addWidget(enable_thermald_btn_);
-        sync_layout->addWidget(stop_tuned_btn_);
-        sync_layout->addWidget(disable_tuned_btn_);
-        sync_layout->addWidget(enable_tuned_btn_);
-        sync_layout->addWidget(stop_tuned_ppd_btn_);
-        sync_layout->addWidget(disable_tuned_ppd_btn_);
-        sync_layout->addWidget(enable_tuned_ppd_btn_);
         sync_group_->setLayout(sync_layout);
         sync_section_ = new CollapsibleSection("Sync + refresh", sync_group_, spacing);
         main_layout->addWidget(sync_section_);
+
+        services_group_ = new QGroupBox();
+        services_group_->setFlat(true);
+        auto *services_layout = new QVBoxLayout();
+        services_layout->setSpacing(spacing);
+
+        auto make_service_controls = [&](const QString &title,
+                                         QPushButton *&start_btn,
+                                         QPushButton *&stop_btn,
+                                         QPushButton *&enable_btn,
+                                         QPushButton *&disable_btn) -> QGroupBox * {
+            auto *group = new QGroupBox(title);
+            auto *grid = new QGridLayout();
+            grid->setVerticalSpacing(spacing / 2);
+            grid->setHorizontalSpacing(spacing / 2);
+            start_btn = new QPushButton("Start");
+            stop_btn = new QPushButton("Stop");
+            enable_btn = new QPushButton("Enable");
+            disable_btn = new QPushButton("Disable");
+            grid->addWidget(start_btn, 0, 0);
+            grid->addWidget(stop_btn, 0, 1);
+            grid->addWidget(enable_btn, 1, 0);
+            grid->addWidget(disable_btn, 1, 1);
+            group->setLayout(grid);
+            return group;
+        };
+
+        thermald_controls_ = make_service_controls("thermald", start_thermald_btn_, stop_thermald_btn_,
+                                                   enable_thermald_btn_, disable_thermald_btn_);
+        tuned_controls_ = make_service_controls("tuned", start_tuned_btn_, stop_tuned_btn_,
+                                                enable_tuned_btn_, disable_tuned_btn_);
+        tuned_ppd_controls_ = make_service_controls("tuned-ppd", start_tuned_ppd_btn_, stop_tuned_ppd_btn_,
+                                                    enable_tuned_ppd_btn_, disable_tuned_ppd_btn_);
+
+        service_controls_layout_ = new QBoxLayout(QBoxLayout::LeftToRight);
+        service_controls_layout_->setSpacing(spacing);
+        service_controls_layout_->addWidget(thermald_controls_);
+        service_controls_layout_->addWidget(tuned_controls_);
+        service_controls_layout_->addWidget(tuned_ppd_controls_);
+        services_layout->addLayout(service_controls_layout_);
+        services_group_->setLayout(services_layout);
+        services_section_ = new CollapsibleSection("Services", services_group_, spacing);
+        main_layout->addWidget(services_section_);
 
         profile_group_ = new QGroupBox();
         profile_group_->setFlat(true);
@@ -976,14 +1017,19 @@ public:
         uv_section_->setExpanded(false);
         ratio_section_->setExpanded(false);
         sync_section_->setExpanded(false);
+        services_section_->setExpanded(false);
         profile_section_->setExpanded(false);
         log_section_->setExpanded(false);
 
         central->setLayout(main_layout);
-        setCentralWidget(central);
+        scroll_area_ = new QScrollArea();
+        scroll_area_->setWidgetResizable(true);
+        scroll_area_->setFrameShape(QFrame::NoFrame);
+        scroll_area_->setWidget(central);
+        setCentralWidget(scroll_area_);
         central->layout()->activate();
         const QSize hint = central->sizeHint();
-        resize(hint);
+        resize(std::clamp(hint.width(), 980, 1600), std::clamp(hint.height(), 720, 1200));
         base_font_ = font();
         base_height_ = height();
         base_width_ = width();
@@ -1001,12 +1047,15 @@ public:
         connect(core_uv_btn_, &QPushButton::clicked, this, &MainWindow::apply_core_uv);
         connect(sync_msr_to_mmio_btn_, &QPushButton::clicked, this, &MainWindow::sync_msr_to_mmio);
         connect(sync_mmio_to_msr_btn_, &QPushButton::clicked, this, &MainWindow::sync_mmio_to_msr);
+        connect(start_thermald_btn_, &QPushButton::clicked, this, &MainWindow::start_thermald);
         connect(stop_thermald_btn_, &QPushButton::clicked, this, &MainWindow::stop_thermald);
         connect(disable_thermald_btn_, &QPushButton::clicked, this, &MainWindow::disable_thermald);
         connect(enable_thermald_btn_, &QPushButton::clicked, this, &MainWindow::enable_thermald);
+        connect(start_tuned_btn_, &QPushButton::clicked, this, &MainWindow::start_tuned);
         connect(stop_tuned_btn_, &QPushButton::clicked, this, &MainWindow::stop_tuned);
         connect(disable_tuned_btn_, &QPushButton::clicked, this, &MainWindow::disable_tuned);
         connect(enable_tuned_btn_, &QPushButton::clicked, this, &MainWindow::enable_tuned);
+        connect(start_tuned_ppd_btn_, &QPushButton::clicked, this, &MainWindow::start_tuned_ppd);
         connect(stop_tuned_ppd_btn_, &QPushButton::clicked, this, &MainWindow::stop_tuned_ppd);
         connect(disable_tuned_ppd_btn_, &QPushButton::clicked, this, &MainWindow::disable_tuned_ppd);
         connect(enable_tuned_ppd_btn_, &QPushButton::clicked, this, &MainWindow::enable_tuned_ppd);
@@ -1055,6 +1104,7 @@ public:
         hook_section(uv_section_);
         hook_section(ratio_section_);
         hook_section(sync_section_);
+        hook_section(services_section_);
         hook_section(profile_section_);
         hook_section(log_section_);
 
@@ -1117,12 +1167,15 @@ private:
         refresh_btn_->setEnabled(enabled);
         sync_msr_to_mmio_btn_->setEnabled(enabled);
         sync_mmio_to_msr_btn_->setEnabled(enabled);
+        start_thermald_btn_->setEnabled(enabled);
         stop_thermald_btn_->setEnabled(enabled);
         disable_thermald_btn_->setEnabled(enabled);
         enable_thermald_btn_->setEnabled(enabled);
+        start_tuned_btn_->setEnabled(enabled);
         stop_tuned_btn_->setEnabled(enabled);
         disable_tuned_btn_->setEnabled(enabled);
         enable_tuned_btn_->setEnabled(enabled);
+        start_tuned_ppd_btn_->setEnabled(enabled);
         stop_tuned_ppd_btn_->setEnabled(enabled);
         disable_tuned_ppd_btn_->setEnabled(enabled);
         enable_tuned_ppd_btn_->setEnabled(enabled);
@@ -1145,6 +1198,8 @@ private:
         int top_min = row_min_width({cpu_section_, status_section_}, top_row_layout_);
         int mid_min = row_min_width({set_section_, ratio_uv_container_}, mid_row_layout_);
         int ratio_min = row_min_width({uv_section_, ratio_section_}, ratio_uv_layout_);
+        int sync_min = row_min_width({refresh_btn_, sync_msr_to_mmio_btn_, sync_mmio_to_msr_btn_}, sync_buttons_layout_);
+        int services_min = row_min_width({thermald_controls_, tuned_controls_, tuned_ppd_controls_}, service_controls_layout_);
 
         auto choose_dir = [&](int stack_width, int min_width) {
             if (w < very_narrow) {
@@ -1159,6 +1214,8 @@ private:
         top_row_layout_->setDirection(choose_dir(900, top_min));
         ratio_uv_layout_->setDirection(choose_dir(800, ratio_min));
         mid_row_layout_->setDirection(choose_dir(1100, mid_min));
+        sync_buttons_layout_->setDirection(choose_dir(760, sync_min));
+        service_controls_layout_->setDirection(choose_dir(1100, services_min));
 
         bool compact = h < short_height;
         int cpu_w = w;
@@ -1883,12 +1940,7 @@ protected:
             return;
         }
         size_updating_ = true;
-        central_->layout()->activate();
-        QSize hint = central_->sizeHint();
-        QSize min_hint = central_->minimumSizeHint();
-        int min_w = std::max(hint.width(), min_hint.width());
-        int min_h = std::max(hint.height(), min_hint.height());
-        setMinimumSize(min_w, min_h);
+        setMinimumSize(780, 520);
         size_updating_ = false;
     }
 
@@ -2192,6 +2244,19 @@ protected:
         refresh();
     }
 
+    void start_thermald() {
+        QString detail = "This will start thermald now.";
+        if (!confirm_action("Start thermald?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.start_thermald(&err)) {
+            show_error("Start thermald failed", err);
+            return;
+        }
+        log_message("Started thermald.");
+    }
+
     void stop_thermald() {
         QString detail = "This will stop thermald.";
         if (!confirm_action("Stop thermald?", detail)) {
@@ -2206,8 +2271,8 @@ protected:
     }
 
     void disable_thermald() {
-        QString detail = "This will disable thermald and stop it now.\n"
-                         "Changes persist across reboots.";
+        QString detail = "This will disable thermald at boot.\n"
+                         "Runtime state is unchanged.";
         if (!confirm_action("Disable thermald?", detail)) {
             return;
         }
@@ -2220,7 +2285,8 @@ protected:
     }
 
     void enable_thermald() {
-        QString detail = "This will enable thermald and start it now.";
+        QString detail = "This will enable thermald at boot.\n"
+                         "Runtime state is unchanged.";
         if (!confirm_action("Enable thermald?", detail)) {
             return;
         }
@@ -2230,6 +2296,19 @@ protected:
             return;
         }
         log_message("Enabled thermald.");
+    }
+
+    void start_tuned() {
+        QString detail = "This will start tuned now.";
+        if (!confirm_action("Start tuned?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.start_tuned(&err)) {
+            show_error("Start tuned failed", err);
+            return;
+        }
+        log_message("Started tuned.");
     }
 
     void stop_tuned() {
@@ -2246,8 +2325,8 @@ protected:
     }
 
     void disable_tuned() {
-        QString detail = "This will disable tuned and stop it now.\n"
-                         "Changes persist across reboots.";
+        QString detail = "This will disable tuned at boot.\n"
+                         "Runtime state is unchanged.";
         if (!confirm_action("Disable tuned?", detail)) {
             return;
         }
@@ -2260,7 +2339,8 @@ protected:
     }
 
     void enable_tuned() {
-        QString detail = "This will enable tuned and start it now.";
+        QString detail = "This will enable tuned at boot.\n"
+                         "Runtime state is unchanged.";
         if (!confirm_action("Enable tuned?", detail)) {
             return;
         }
@@ -2270,6 +2350,19 @@ protected:
             return;
         }
         log_message("Enabled tuned.");
+    }
+
+    void start_tuned_ppd() {
+        QString detail = "This will start tuned-ppd now.";
+        if (!confirm_action("Start tuned-ppd?", detail)) {
+            return;
+        }
+        QString err;
+        if (!backend_.start_tuned_ppd(&err)) {
+            show_error("Start tuned-ppd failed", err);
+            return;
+        }
+        log_message("Started tuned-ppd.");
     }
 
     void stop_tuned_ppd() {
@@ -2286,8 +2379,8 @@ protected:
     }
 
     void disable_tuned_ppd() {
-        QString detail = "This will disable tuned-ppd and stop it now.\n"
-                         "Changes persist across reboots.";
+        QString detail = "This will disable tuned-ppd at boot.\n"
+                         "Runtime state is unchanged.";
         if (!confirm_action("Disable tuned-ppd?", detail)) {
             return;
         }
@@ -2300,7 +2393,8 @@ protected:
     }
 
     void enable_tuned_ppd() {
-        QString detail = "This will enable tuned-ppd and start it now.";
+        QString detail = "This will enable tuned-ppd at boot.\n"
+                         "Runtime state is unchanged.";
         if (!confirm_action("Enable tuned-ppd?", detail)) {
             return;
         }
@@ -2390,12 +2484,15 @@ protected:
     QPushButton *core_uv_btn_ = nullptr;
     QPushButton *sync_msr_to_mmio_btn_ = nullptr;
     QPushButton *sync_mmio_to_msr_btn_ = nullptr;
+    QPushButton *start_thermald_btn_ = nullptr;
     QPushButton *stop_thermald_btn_ = nullptr;
     QPushButton *disable_thermald_btn_ = nullptr;
     QPushButton *enable_thermald_btn_ = nullptr;
+    QPushButton *start_tuned_btn_ = nullptr;
     QPushButton *stop_tuned_btn_ = nullptr;
     QPushButton *disable_tuned_btn_ = nullptr;
     QPushButton *enable_tuned_btn_ = nullptr;
+    QPushButton *start_tuned_ppd_btn_ = nullptr;
     QPushButton *stop_tuned_ppd_btn_ = nullptr;
     QPushButton *disable_tuned_ppd_btn_ = nullptr;
     QPushButton *enable_tuned_ppd_btn_ = nullptr;
@@ -2421,20 +2518,28 @@ protected:
     CollapsibleSection *ratio_section_ = nullptr;
     CollapsibleSection *uv_section_ = nullptr;
     CollapsibleSection *sync_section_ = nullptr;
+    CollapsibleSection *services_section_ = nullptr;
     CollapsibleSection *profile_section_ = nullptr;
     CollapsibleSection *log_section_ = nullptr;
     QGroupBox *ratio_group_ = nullptr;
     QGroupBox *uv_group_ = nullptr;
     QWidget *ratio_uv_container_ = nullptr;
     QGroupBox *sync_group_ = nullptr;
+    QGroupBox *services_group_ = nullptr;
+    QGroupBox *thermald_controls_ = nullptr;
+    QGroupBox *tuned_controls_ = nullptr;
+    QGroupBox *tuned_ppd_controls_ = nullptr;
     QGroupBox *profile_group_ = nullptr;
     QWidget *central_ = nullptr;
+    QScrollArea *scroll_area_ = nullptr;
 
     QPlainTextEdit *log_ = nullptr;
 
     QBoxLayout *top_row_layout_ = nullptr;
     QBoxLayout *mid_row_layout_ = nullptr;
     QBoxLayout *ratio_uv_layout_ = nullptr;
+    QBoxLayout *sync_buttons_layout_ = nullptr;
+    QBoxLayout *service_controls_layout_ = nullptr;
 
     std::vector<Row> cpu_rows_;
     std::vector<Row> status_rows_;
@@ -2465,7 +2570,6 @@ int main(int argc, char **argv) {
     QCoreApplication::setOrganizationName("limits_droper");
     QCoreApplication::setApplicationName("limits_ui_qt");
     MainWindow window;
-    window.resize(window.minimumSize());
     window.show();
     return app.exec();
 }

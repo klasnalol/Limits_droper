@@ -139,20 +139,24 @@ Write kernel powercap limits (intel-rapl, in micro-watts):
 sudo ./build/limits_helper --write-powercap 160000000 170000000
 ```
 
-Stop/disable/enable powercap writer services:
+Start/stop/disable/enable powercap writer services:
 ```bash
+sudo ./build/limits_helper --start-thermald
 sudo ./build/limits_helper --stop-thermald
 sudo ./build/limits_helper --disable-thermald
 sudo ./build/limits_helper --enable-thermald
 
+sudo ./build/limits_helper --start-tuned
 sudo ./build/limits_helper --stop-tuned
 sudo ./build/limits_helper --disable-tuned
 sudo ./build/limits_helper --enable-tuned
 
+sudo ./build/limits_helper --start-tuned-ppd
 sudo ./build/limits_helper --stop-tuned-ppd
 sudo ./build/limits_helper --disable-tuned-ppd
 sudo ./build/limits_helper --enable-tuned-ppd
 ```
+`--start-*` / `--stop-*` change runtime state now. `--enable-*` / `--disable-*` only change boot persistence.
 
 Interactive UI (read/set/sync MSR + MMIO):
 ```bash

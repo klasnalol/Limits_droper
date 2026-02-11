@@ -533,12 +533,15 @@ static void usage(const char *argv0) {
         "  %s --write-msr 0xHEX64\n"
         "  %s --write-mmio 0xHEX64\n"
         "  %s --write-powercap <pl1_uw> <pl2_uw>\n"
+        "  %s --start-thermald\n"
         "  %s --stop-thermald\n"
         "  %s --disable-thermald\n"
         "  %s --enable-thermald\n"
+        "  %s --start-tuned\n"
         "  %s --stop-tuned\n"
         "  %s --disable-tuned\n"
         "  %s --enable-tuned\n"
+        "  %s --start-tuned-ppd\n"
         "  %s --stop-tuned-ppd\n"
         "  %s --disable-tuned-ppd\n"
         "  %s --enable-tuned-ppd\n"
@@ -548,7 +551,7 @@ static void usage(const char *argv0) {
         "  %s --set-pe-ratio <p_int> <e_int>\n"
         "  %s --set-core-uv <mV>\n",
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -716,6 +719,17 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (strcmp(argv[1], "--start-thermald") == 0) {
+        const char *services[] = {"thermald.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("start", false, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to start thermald: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
     if (strcmp(argv[1], "--stop-thermald") == 0) {
         const char *services[] = {"thermald.service"};
         char err[256] = {0};
@@ -730,7 +744,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--disable-thermald") == 0) {
         const char *services[] = {"thermald.service"};
         char err[256] = {0};
-        if (run_systemctl_action("disable", true, services, 1, err, sizeof(err)) != 0) {
+        if (run_systemctl_action("disable", false, services, 1, err, sizeof(err)) != 0) {
             fprintf(stderr, "Failed to disable thermald: %s\n", err[0] ? err : "unknown error");
             return 1;
         }
@@ -741,8 +755,19 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--enable-thermald") == 0) {
         const char *services[] = {"thermald.service"};
         char err[256] = {0};
-        if (run_systemctl_action("enable", true, services, 1, err, sizeof(err)) != 0) {
+        if (run_systemctl_action("enable", false, services, 1, err, sizeof(err)) != 0) {
             fprintf(stderr, "Failed to enable thermald: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--start-tuned") == 0) {
+        const char *services[] = {"tuned.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("start", false, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to start tuned: %s\n", err[0] ? err : "unknown error");
             return 1;
         }
         printf("OK\n");
@@ -763,7 +788,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--disable-tuned") == 0) {
         const char *services[] = {"tuned.service"};
         char err[256] = {0};
-        if (run_systemctl_action("disable", true, services, 1, err, sizeof(err)) != 0) {
+        if (run_systemctl_action("disable", false, services, 1, err, sizeof(err)) != 0) {
             fprintf(stderr, "Failed to disable tuned: %s\n", err[0] ? err : "unknown error");
             return 1;
         }
@@ -774,8 +799,19 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--enable-tuned") == 0) {
         const char *services[] = {"tuned.service"};
         char err[256] = {0};
-        if (run_systemctl_action("enable", true, services, 1, err, sizeof(err)) != 0) {
+        if (run_systemctl_action("enable", false, services, 1, err, sizeof(err)) != 0) {
             fprintf(stderr, "Failed to enable tuned: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--start-tuned-ppd") == 0) {
+        const char *services[] = {"tuned-ppd.service"};
+        char err[256] = {0};
+        if (run_systemctl_action("start", false, services, 1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to start tuned-ppd: %s\n", err[0] ? err : "unknown error");
             return 1;
         }
         printf("OK\n");
@@ -796,7 +832,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--disable-tuned-ppd") == 0) {
         const char *services[] = {"tuned-ppd.service"};
         char err[256] = {0};
-        if (run_systemctl_action("disable", true, services, 1, err, sizeof(err)) != 0) {
+        if (run_systemctl_action("disable", false, services, 1, err, sizeof(err)) != 0) {
             fprintf(stderr, "Failed to disable tuned-ppd: %s\n", err[0] ? err : "unknown error");
             return 1;
         }
@@ -807,7 +843,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--enable-tuned-ppd") == 0) {
         const char *services[] = {"tuned-ppd.service"};
         char err[256] = {0};
-        if (run_systemctl_action("enable", true, services, 1, err, sizeof(err)) != 0) {
+        if (run_systemctl_action("enable", false, services, 1, err, sizeof(err)) != 0) {
             fprintf(stderr, "Failed to enable tuned-ppd: %s\n", err[0] ? err : "unknown error");
             return 1;
         }
