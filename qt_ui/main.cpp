@@ -1066,7 +1066,7 @@ public:
 
         connect(profile_path_, &QLineEdit::textChanged, this, &MainWindow::save_preferences);
         connect(fallback_path_, &QLineEdit::textChanged, this, &MainWindow::save_preferences);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
         connect(startup_enabled_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
         connect(startup_use_fallback_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_limits_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
