@@ -15,7 +15,9 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHash>
+#include <QHeaderView>
 #include <QHBoxLayout>
+#include <QHideEvent>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -28,16 +30,30 @@
 #include <QResizeEvent>
 #include <QSaveFile>
 #include <QScrollArea>
-#include <QToolButton>
+#include <QShowEvent>
+#include <QSpinBox>
+#include <QStandardPaths>
 #include <QSettings>
 #include <QSet>
 #include <QStyle>
 #include <QSize>
-#include <QSpinBox>
-#include <QStandardPaths>
+#include <QTabWidget>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QThread>
+#include <QTimer>
+#include <QToolButton>
 #include <QString>
 #include <QVBoxLayout>
 #include <QtGlobal>
+#include <QAction>
+#include <QCloseEvent>
+#include <QIcon>
+#include <QMenu>
+#include <QPainter>
+#include <QPen>
+#include <QPixmap>
+#include <QSystemTrayIcon>
 #include <vector>
 
 #include <cinttypes>
@@ -73,6 +89,41 @@ QString hex64(std::uint64_t v) {
 QString units_to_text(std::uint16_t units, double unit_watts) {
     double watts = static_cast<double>(units) * unit_watts;
     return QString("units %1 (%2 W)").arg(units).arg(watts, 0, 'f', 2);
+}
+
+QIcon create_app_icon() {
+    QIcon icon;
+    const int sizes[] = {16, 22, 24, 32, 48, 64, 128, 256};
+    for (int sz : sizes) {
+        QPixmap px(sz, sz);
+        px.fill(Qt::transparent);
+        QPainter p(&px);
+        p.setRenderHints(QPainter::Antialiasing | QPainter::TextAntialiasing);
+        QRect rect = px.rect().adjusted(1, 1, -1, -1);
+        // dark rounded background
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(45, 45, 45));
+        int radius = std::max(2, sz / 8);
+        p.drawRoundedRect(rect, radius, radius);
+        // "TDP" text
+        QFont f = p.font();
+        f.setBold(true);
+        f.setPixelSize(std::max(6, static_cast<int>(sz * 0.42)));
+        p.setFont(f);
+        p.setPen(Qt::white);
+        p.drawText(rect, Qt::AlignCenter, "TDP");
+        // crossed-out line
+        QPen pen(QColor(235, 60, 60));
+        pen.setWidthF(std::max(1.0, sz * 0.1));
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        int margin = std::max(2, static_cast<int>(sz * 0.12));
+        p.drawLine(rect.left() + margin, rect.bottom() - margin,
+                   rect.right() - margin, rect.top() + margin);
+        p.end();
+        icon.addPixmap(px);
+    }
+    return icon;
 }
 
 struct CpuInfo {
@@ -213,6 +264,85 @@ double read_current_mhz_for_cpu(int cpu) {
     return mhz;
 }
 
+struct HwmonTemp {
+    int index = -1;
+    QString label;
+    QString input_path;
+};
+
+QList<HwmonTemp> discover_coretemp_inputs() {
+    QList<HwmonTemp> result;
+    QDir hwmon_dir("/sys/class/hwmon");
+    for (const QString &name : hwmon_dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        QString name_path = hwmon_dir.absoluteFilePath(name + "/name");
+        if (read_text_file(name_path) != "coretemp") {
+            continue;
+        }
+        QString base = hwmon_dir.absoluteFilePath(name);
+        QDir base_dir(base);
+        for (const QString &entry : base_dir.entryList(QDir::Files)) {
+            if (!entry.startsWith("temp") || !entry.endsWith("_input")) {
+                continue;
+            }
+            QString num_part = entry.mid(4, entry.length() - 4 - 6);
+            bool ok = false;
+            int idx = num_part.toInt(&ok);
+            if (!ok) {
+                continue;
+            }
+            HwmonTemp t;
+            t.index = idx;
+            t.input_path = base + "/" + entry;
+            t.label = read_text_file(base + "/temp" + num_part + "_label");
+            result.append(t);
+        }
+    }
+    return result;
+}
+
+int physical_core_for_cpu(int cpu) {
+    QString text = read_text_file(QString("/sys/devices/system/cpu/cpu%1/topology/core_id").arg(cpu));
+    if (text.isEmpty()) {
+        return -1;
+    }
+    bool ok = false;
+    int id = text.toInt(&ok);
+    return ok ? id : -1;
+}
+
+int read_temp_millidegrees(const QString &path) {
+    QString text = read_text_file(path);
+    if (text.isEmpty()) {
+        return -1;
+    }
+    bool ok = false;
+    int md = text.toInt(&ok);
+    if (!ok || md <= 0) {
+        return -1;
+    }
+    return md;
+}
+
+QString thermal_status_summary(std::uint64_t status) {
+    QStringList flags;
+    if (status & 0x01u) {
+        flags.append("THERMAL");
+    }
+    if (status & 0x04u) {
+        flags.append("PROCHOT");
+    }
+    if (status & 0x20u) {
+        flags.append("PWR");
+    }
+    if (status & 0x40u) {
+        flags.append("CUR");
+    }
+    if (flags.isEmpty()) {
+        return "OK";
+    }
+    return flags.join("+");
+}
+
 QList<int> parse_cpu_list(const QString &list) {
     QList<int> out;
     if (list.isEmpty()) {
@@ -284,6 +414,15 @@ struct ReadState {
     QString core_uv_raw;
 };
 
+struct CoreSensor {
+    int cpu = -1;
+    char type = 'U';
+    int ratio = 0;
+    bool ratio_valid = false;
+    std::uint64_t thermal = 0;
+    bool thermal_valid = false;
+};
+
 } // namespace
 
 class CollapsibleSection : public QFrame {
@@ -345,6 +484,10 @@ class HelperBackend {
 public:
     HelperBackend() : helper_path_(resolve_helper_path()) {}
 
+    ~HelperBackend() {
+        stop_server();
+    }
+
     bool helper_available(QString *err) const {
         QFileInfo info(helper_path_);
         if (!info.exists()) {
@@ -365,94 +508,102 @@ public:
 
     bool read_state(ReadState &state, QString *err) const {
         QString out;
-        QString err_out;
-        if (!run_pkexec({"--read"}, &out, &err_out)) {
-            if (err) {
-                *err = err_out.isEmpty() ? "Failed to run helper" : err_out;
-            }
+        if (!run_command("READ", &out, err)) {
             return false;
         }
         return parse_state(out, state, err);
     }
 
     bool write_msr(std::uint64_t val, QString *err) const {
-        return run_simple({"--write-msr", hex64(val)}, err);
+        return run_simple(QString("WRITE-MSR %1").arg(hex64(val)), err);
     }
 
     bool write_mmio(std::uint64_t val, QString *err) const {
-        return run_simple({"--write-mmio", hex64(val)}, err);
+        return run_simple(QString("WRITE-MMIO %1").arg(hex64(val)), err);
     }
 
     bool write_powercap(std::uint64_t pl1_uw, std::uint64_t pl2_uw, QString *err) const {
-        return run_simple({"--write-powercap", QString::number(pl1_uw), QString::number(pl2_uw)}, err);
+        return run_simple(QString("WRITE-POWERCAP %1 %2").arg(pl1_uw).arg(pl2_uw), err);
     }
 
     bool start_thermald(QString *err) const {
-        return run_simple({"--start-thermald"}, err);
+        return run_simple("START-THERMALD", err);
     }
 
     bool stop_thermald(QString *err) const {
-        return run_simple({"--stop-thermald"}, err);
+        return run_simple("STOP-THERMALD", err);
     }
 
     bool disable_thermald(QString *err) const {
-        return run_simple({"--disable-thermald"}, err);
+        return run_simple("DISABLE-THERMALD", err);
     }
 
     bool enable_thermald(QString *err) const {
-        return run_simple({"--enable-thermald"}, err);
+        return run_simple("ENABLE-THERMALD", err);
     }
 
     bool start_tuned(QString *err) const {
-        return run_simple({"--start-tuned"}, err);
+        return run_simple("START-TUNED", err);
     }
 
     bool stop_tuned(QString *err) const {
-        return run_simple({"--stop-tuned"}, err);
+        return run_simple("STOP-TUNED", err);
     }
 
     bool disable_tuned(QString *err) const {
-        return run_simple({"--disable-tuned"}, err);
+        return run_simple("DISABLE-TUNED", err);
     }
 
     bool enable_tuned(QString *err) const {
-        return run_simple({"--enable-tuned"}, err);
+        return run_simple("ENABLE-TUNED", err);
     }
 
     bool start_tuned_ppd(QString *err) const {
-        return run_simple({"--start-tuned-ppd"}, err);
+        return run_simple("START-TUNED-PPD", err);
     }
 
     bool stop_tuned_ppd(QString *err) const {
-        return run_simple({"--stop-tuned-ppd"}, err);
+        return run_simple("STOP-TUNED-PPD", err);
     }
 
     bool disable_tuned_ppd(QString *err) const {
-        return run_simple({"--disable-tuned-ppd"}, err);
+        return run_simple("DISABLE-TUNED-PPD", err);
     }
 
     bool enable_tuned_ppd(QString *err) const {
-        return run_simple({"--enable-tuned-ppd"}, err);
+        return run_simple("ENABLE-TUNED-PPD", err);
     }
 
     bool set_p_ratio(int ratio, QString *err) const {
-        return run_simple({"--set-p-ratio", QString::number(ratio)}, err);
+        return run_simple(QString("SET-P-RATIO %1").arg(ratio), err);
     }
 
     bool set_e_ratio(int ratio, QString *err) const {
-        return run_simple({"--set-e-ratio", QString::number(ratio)}, err);
+        return run_simple(QString("SET-E-RATIO %1").arg(ratio), err);
     }
 
     bool set_pe_ratio(int ratio_p, int ratio_e, QString *err) const {
-        return run_simple({"--set-pe-ratio", QString::number(ratio_p), QString::number(ratio_e)}, err);
+        return run_simple(QString("SET-PE-RATIO %1 %2").arg(ratio_p).arg(ratio_e), err);
     }
 
     bool set_all_ratio(int ratio, QString *err) const {
-        return run_simple({"--set-all-ratio", QString::number(ratio)}, err);
+        return run_simple(QString("SET-ALL-RATIO %1").arg(ratio), err);
     }
 
     bool set_core_uv(double mv, QString *err) const {
-        return run_simple({"--set-core-uv", QString::number(mv, 'f', 3)}, err);
+        return run_simple(QString("SET-CORE-UV %1").arg(mv, 0, 'f', 3), err);
+    }
+
+    bool set_cpu_ratio(int cpu, int ratio, QString *err) const {
+        return run_simple(QString("SET-CPU-RATIO %1 %2").arg(cpu).arg(ratio), err);
+    }
+
+    bool read_core_sensors(QList<CoreSensor> &out, QString *err) const {
+        QString out_text;
+        if (!run_command("READ-CORE-SENSORS", &out_text, err)) {
+            return false;
+        }
+        return parse_core_sensors(out_text, out, err);
     }
 
 private:
@@ -468,52 +619,196 @@ private:
         return QStringLiteral("/usr/local/bin/limits_helper");
     }
 
-    bool run_simple(const QStringList &args, QString *err) const {
-        QString out;
-        QString err_out;
-        if (!run_pkexec(args, &out, &err_out)) {
+    bool ensure_server_running(QString *err) const {
+        if (server_ && server_->state() == QProcess::Running) {
+            return true;
+        }
+        if (server_) {
+            stop_server();
+        }
+
+        server_ = new QProcess();
+        server_->setProgram("pkexec");
+        QStringList args;
+        args << helper_path_ << "--server";
+        server_->setArguments(args);
+        server_->start();
+
+        if (!server_->waitForStarted(-1)) {
             if (err) {
-                *err = err_out.isEmpty() ? "Failed to run helper" : err_out;
+                *err = "Failed to start helper server.";
+            }
+            stop_server();
+            return false;
+        }
+
+        // Give pkexec a moment to prompt and authorize. We don't wait for
+        // output here because the server only speaks when commanded.
+        if (!server_->waitForReadyRead(100)) {
+            // Not an error yet; auth may still be in progress.
+        }
+
+        // Consume any initial output (e.g. pkexec messages).
+        server_->readAllStandardOutput();
+        server_->readAllStandardError();
+        return true;
+    }
+
+    void stop_server() const {
+        if (!server_) {
+            return;
+        }
+        if (server_->state() == QProcess::Running) {
+            server_->write("QUIT\n");
+            server_->waitForBytesWritten(1000);
+            server_->waitForFinished(1000);
+        }
+        if (server_->state() != QProcess::NotRunning) {
+            server_->terminate();
+            server_->waitForFinished(1000);
+            if (server_->state() != QProcess::NotRunning) {
+                server_->kill();
+                server_->waitForFinished(1000);
+            }
+        }
+        delete server_;
+        server_ = nullptr;
+    }
+
+    bool run_simple(const QString &command, QString *err) const {
+        QString out;
+        if (!run_command(command, &out, err)) {
+            return false;
+        }
+        return true;
+    }
+
+    bool run_command(const QString &command, QString *out, QString *err) const {
+        if (!ensure_server_running(err)) {
+            return false;
+        }
+
+        server_->write(command.toUtf8() + "\n");
+        if (!server_->waitForBytesWritten(5000)) {
+            if (err) {
+                *err = "Failed to send command to helper server.";
+            }
+            stop_server();
+            return false;
+        }
+
+        QString response;
+        QByteArray buffer;
+        while (true) {
+            if (!server_->waitForReadyRead(10000)) {
+                if (err) {
+                    *err = "Helper server timed out.";
+                }
+                stop_server();
+                return false;
+            }
+            buffer.append(server_->readAllStandardOutput());
+            response = QString::fromLocal8Bit(buffer);
+            if (response.contains("\nEND\n") || response.endsWith("\nEND")) {
+                break;
+            }
+        }
+
+        // Strip the END marker.
+        QString text = response.trimmed();
+        if (text.endsWith("END")) {
+            text.chop(3);
+            text = text.trimmed();
+        }
+
+        if (out) {
+            *out = text;
+        }
+
+        // Treat stderr as error if non-empty or if response is empty.
+        QString err_text = QString::fromLocal8Bit(server_->readAllStandardError()).trimmed();
+        if (!err_text.isEmpty()) {
+            if (err) {
+                *err = err_text;
+            }
+            return false;
+        }
+
+        if (text.isEmpty()) {
+            if (err) {
+                *err = "Empty response from helper server.";
             }
             return false;
         }
         return true;
     }
 
-    bool run_pkexec(const QStringList &args, QString *out, QString *err) const {
-        QProcess proc;
-        proc.setProgram("pkexec");
-        QStringList full_args;
-        full_args << helper_path_;
-        full_args << args;
-        proc.setArguments(full_args);
-        proc.start();
+    bool parse_core_sensors(const QString &out, QList<CoreSensor> &sensors, QString *err) const {
+        sensors.clear();
+        QStringList lines = out.split('\n', Qt::SkipEmptyParts);
+        int expected = -1;
+        QHash<int, CoreSensor> by_index;
 
-        if (!proc.waitForFinished(-1)) {
-            if (err) {
-                *err = "Helper timed out.";
+        for (const QString &line : lines) {
+            if (line.startsWith("CORE_SENSOR_COUNT=")) {
+                bool ok = false;
+                expected = line.mid(18).toInt(&ok);
+                if (!ok) {
+                    expected = -1;
+                }
+                continue;
             }
-            return false;
-        }
-
-        if (out) {
-            *out = QString::fromLocal8Bit(proc.readAllStandardOutput());
-        }
-        QString err_text = QString::fromLocal8Bit(proc.readAllStandardError());
-
-        if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
-            if (err) {
-                if (!err_text.isEmpty()) {
-                    *err = err_text.trimmed();
-                } else {
-                    *err = QString("Helper failed (exit %1)").arg(proc.exitCode());
+            if (!line.startsWith("CORE_SENSOR_")) {
+                continue;
+            }
+            QString payload = line.mid(12);
+            int eq = payload.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            bool ok = false;
+            int idx = payload.left(eq).toInt(&ok);
+            if (!ok) {
+                continue;
+            }
+            QStringList parts = payload.mid(eq + 1).split(',', Qt::SkipEmptyParts);
+            CoreSensor s;
+            for (const QString &part : parts) {
+                int sep = part.indexOf('=');
+                if (sep <= 0) {
+                    continue;
+                }
+                QString key = part.left(sep).trimmed();
+                QString value = part.mid(sep + 1).trimmed();
+                if (key == "cpu") {
+                    s.cpu = value.toInt(&ok);
+                    if (!ok) {
+                        s.cpu = -1;
+                    }
+                } else if (key == "type") {
+                    s.type = value.isEmpty() ? 'U' : value.at(0).toLatin1();
+                } else if (key == "ratio") {
+                    s.ratio = value.toInt(&ok);
+                    s.ratio_valid = ok;
+                } else if (key == "thermal") {
+                    s.thermal = value.toULongLong(&ok, 0);
+                    s.thermal_valid = ok;
                 }
             }
-            return false;
+            by_index.insert(idx, s);
         }
 
-        if (err) {
-            *err = err_text.trimmed();
+        for (int i = 0; i < std::max(expected, static_cast<int>(by_index.size())); ++i) {
+            if (by_index.contains(i)) {
+                sensors.append(by_index.value(i));
+            }
+        }
+
+        if (sensors.isEmpty()) {
+            if (err) {
+                *err = "No core sensor data from helper.";
+            }
+            return false;
         }
         return true;
     }
@@ -591,6 +886,7 @@ private:
     }
 
     QString helper_path_;
+    mutable QProcess *server_ = nullptr;
 };
 
 class MainWindow : public QMainWindow {
@@ -599,6 +895,10 @@ class MainWindow : public QMainWindow {
 public:
     MainWindow() {
         setWindowTitle("Limits UI");
+
+        QIcon app_icon = QIcon::fromTheme("limits_droper", create_app_icon());
+        setWindowIcon(app_icon);
+        apply_stylesheet();
 
         auto *central = new QWidget();
         central_ = central;
@@ -966,6 +1266,8 @@ public:
         startup_ratio_target_ = new QComboBox();
         startup_ratio_target_->addItems({"P", "E", "P+E", "All"});
         startup_apply_core_uv_ = new QCheckBox("Apply core UV");
+        close_to_tray_ = new QCheckBox("Close to system tray");
+        autostart_enabled_ = new QCheckBox("Start automatically on login");
 
         auto *limits_row = new QHBoxLayout();
         limits_row->setSpacing(spacing);
@@ -992,6 +1294,8 @@ public:
         add_startup_row("Limits", limits_row_widget);
         add_startup_row("Ratios", ratio_row_widget);
         add_startup_row("Core UV", startup_apply_core_uv_);
+        add_startup_row("Close to tray", close_to_tray_);
+        add_startup_row("Autostart", autostart_enabled_);
 
         layout_grid_rows(startup_grid_, startup_rows_, false);
         profile_layout->addLayout(startup_grid_);
@@ -999,6 +1303,9 @@ public:
         profile_group_->setLayout(profile_layout);
         profile_section_ = new CollapsibleSection("Profiles + startup", profile_group_, spacing);
         main_layout->addWidget(profile_section_);
+
+        build_per_core_ratio_section(spacing);
+        main_layout->addWidget(per_core_section_);
 
         log_ = new QPlainTextEdit();
         log_->setReadOnly(true);
@@ -1019,17 +1326,25 @@ public:
         sync_section_->setExpanded(false);
         services_section_->setExpanded(false);
         profile_section_->setExpanded(false);
+        per_core_section_->setExpanded(false);
         log_section_->setExpanded(false);
 
         central->setLayout(main_layout);
-        scroll_area_ = new QScrollArea();
-        scroll_area_->setWidgetResizable(true);
-        scroll_area_->setFrameShape(QFrame::NoFrame);
-        scroll_area_->setWidget(central);
-        setCentralWidget(scroll_area_);
+        auto *main_scroll = new QScrollArea();
+        main_scroll->setWidgetResizable(true);
+        main_scroll->setFrameShape(QFrame::NoFrame);
+        main_scroll->setWidget(central);
+
+        build_sensors_tab();
+
+        tab_widget_ = new QTabWidget();
+        tab_widget_->addTab(main_scroll, "Main");
+        tab_widget_->addTab(sensors_tab_, "Sensors");
+        setCentralWidget(tab_widget_);
+
         central->layout()->activate();
         const QSize hint = central->sizeHint();
-        resize(std::clamp(hint.width(), 980, 1600), std::clamp(hint.height(), 720, 1200));
+        resize(std::clamp(hint.width(), 1040, 1700), std::clamp(hint.height(), 760, 1300));
         base_font_ = font();
         base_height_ = height();
         base_width_ = width();
@@ -1072,6 +1387,7 @@ public:
         connect(startup_apply_limits_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_ratios_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_core_uv_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
+        connect(close_to_tray_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
         connect(powercap_check_, &QCheckBox::checkStateChanged, this, &MainWindow::save_preferences);
 #else
         connect(startup_enabled_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
@@ -1079,12 +1395,22 @@ public:
         connect(startup_apply_limits_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_ratios_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
         connect(startup_apply_core_uv_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
+        connect(close_to_tray_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
         connect(powercap_check_, &QCheckBox::stateChanged, this, &MainWindow::save_preferences);
 #endif
         connect(startup_limits_target_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::save_preferences);
         connect(startup_ratio_target_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::save_preferences);
+        connect(autostart_enabled_, &QCheckBox::toggled, this, [this]() {
+            update_autostart_file();
+            save_preferences();
+        });
 
         connect(qApp, &QCoreApplication::aboutToQuit, this, &MainWindow::on_about_to_quit);
+        connect(tab_widget_, &QTabWidget::currentChanged, this, [this](int) {
+            maybe_start_sensor_timer();
+        });
+
+        create_tray_icon(app_icon);
 
         auto hook_section = [&](CollapsibleSection *section) {
             if (!section) {
@@ -1106,6 +1432,7 @@ public:
         hook_section(sync_section_);
         hook_section(services_section_);
         hook_section(profile_section_);
+        hook_section(per_core_section_);
         hook_section(log_section_);
 
         load_cpu_info();
@@ -1115,7 +1442,45 @@ public:
         update_responsive_layout();
     }
 
+private slots:
+    void tray_show_hide() {
+        if (isVisible()) {
+            hide();
+        } else {
+            show();
+            raise();
+            activateWindow();
+        }
+        maybe_start_sensor_timer();
+    }
+
+    void tray_quit() {
+        quitting_ = true;
+        qApp->quit();
+    }
+
 private:
+    void create_tray_icon(const QIcon &icon) {
+        if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+            log_message("System tray is not available; close-to-tray disabled.");
+            return;
+        }
+        tray_menu_ = new QMenu(this);
+        tray_show_action_ = tray_menu_->addAction("Show / Hide", this, &MainWindow::tray_show_hide);
+        tray_menu_->addSeparator();
+        tray_quit_action_ = tray_menu_->addAction("Quit", this, &MainWindow::tray_quit);
+        tray_icon_ = new QSystemTrayIcon(icon, this);
+        tray_icon_->setToolTip("Limits Droper");
+        tray_icon_->setContextMenu(tray_menu_);
+        connect(tray_icon_, &QSystemTrayIcon::activated, this,
+                [this](QSystemTrayIcon::ActivationReason reason) {
+                    if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick) {
+                        tray_show_hide();
+                    }
+                });
+        tray_icon_->show();
+    }
+
     enum class Target {
         Msr,
         Mmio,
@@ -1155,6 +1520,24 @@ private:
         QWidget *value = nullptr;
     };
 
+    struct PerCoreRow {
+        int cpu = -1;
+        QLabel *type_label = nullptr;
+        QLabel *cur_label = nullptr;
+        QSpinBox *target_spin = nullptr;
+        QPushButton *set_btn = nullptr;
+    };
+
+    struct SensorRow {
+        int cpu = -1;
+        QTableWidgetItem *type_item = nullptr;
+        QTableWidgetItem *target_item = nullptr;
+        QTableWidgetItem *ratio_item = nullptr;
+        QTableWidgetItem *freq_item = nullptr;
+        QTableWidgetItem *temp_item = nullptr;
+        QTableWidgetItem *throttle_item = nullptr;
+    };
+
     void set_controls_enabled(bool enabled) {
         status_group_->setEnabled(enabled);
         set_msr_btn_->setEnabled(enabled);
@@ -1186,6 +1569,20 @@ private:
         e_ratio_spin_->setEnabled(enabled);
         core_uv_spin_->setEnabled(enabled);
         core_uv_btn_->setEnabled(enabled);
+        if (per_core_apply_all_btn_) {
+            per_core_apply_all_btn_->setEnabled(enabled);
+        }
+        if (per_core_reset_btn_) {
+            per_core_reset_btn_->setEnabled(enabled);
+        }
+        for (const PerCoreRow &row : per_core_rows_) {
+            if (row.target_spin) {
+                row.target_spin->setEnabled(enabled);
+            }
+            if (row.set_btn) {
+                row.set_btn->setEnabled(enabled);
+            }
+        }
     }
 
     void update_responsive_layout() {
@@ -1555,6 +1952,11 @@ private:
         startup_apply_ratios_->setChecked(settings.value("apply_ratios", false).toBool());
         startup_ratio_target_->setCurrentIndex(settings.value("ratio_target", 2).toInt());
         startup_apply_core_uv_->setChecked(settings.value("apply_core_uv", false).toBool());
+        bool tray_available = QSystemTrayIcon::isSystemTrayAvailable();
+        close_to_tray_->setChecked(settings.value("close_to_tray", tray_available).toBool());
+        close_to_tray_->setEnabled(tray_available);
+        autostart_enabled_->setChecked(settings.value("autostart", false).toBool());
+        update_autostart_file();
         settings.endGroup();
         loading_prefs_ = false;
     }
@@ -1581,7 +1983,39 @@ private:
         settings.setValue("apply_ratios", startup_apply_ratios_->isChecked());
         settings.setValue("ratio_target", startup_ratio_target_->currentIndex());
         settings.setValue("apply_core_uv", startup_apply_core_uv_->isChecked());
+        settings.setValue("close_to_tray", close_to_tray_->isChecked());
+        settings.setValue("autostart", autostart_enabled_->isChecked());
         settings.endGroup();
+    }
+
+    void update_autostart_file() {
+        QString dir = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation) + "/autostart";
+        if (!QDir().mkpath(dir)) {
+            return;
+        }
+        QString path = QDir(dir).filePath("limits_droper.desktop");
+        if (!autostart_enabled_ || !autostart_enabled_->isChecked()) {
+            QFile::remove(path);
+            return;
+        }
+        QString exec = QCoreApplication::applicationFilePath();
+        QString exec_quoted = exec.contains(QLatin1Char(' ')) ? QString("\"%1\"").arg(exec) : exec;
+        QString desktop = QString(
+            "[Desktop Entry]\n"
+            "Name=Limits Droper\n"
+            "Comment=Adjust Intel CPU power limits\n"
+            "Exec=%1\n"
+            "Icon=limits_droper\n"
+            "Type=Application\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n")
+            .arg(exec_quoted);
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly)) {
+            return;
+        }
+        file.write(desktop.toUtf8());
+        file.commit();
     }
 
     Target startup_limits_target_value() const {
@@ -1872,12 +2306,155 @@ protected:
         update_responsive_layout();
     }
 
+    void closeEvent(QCloseEvent *event) override {
+        if (quitting_ || !tray_icon_ || !tray_icon_->isVisible() || !close_to_tray_->isChecked()) {
+            event->accept();
+            return;
+        }
+        hide();
+        event->ignore();
+        maybe_start_sensor_timer();
+    }
+
+    void showEvent(QShowEvent *event) override {
+        QMainWindow::showEvent(event);
+        maybe_start_sensor_timer();
+    }
+
+    void hideEvent(QHideEvent *event) override {
+        QMainWindow::hideEvent(event);
+        maybe_start_sensor_timer();
+    }
+
     QLineEdit *make_readonly_line() {
         auto *line = new QLineEdit();
         line->setReadOnly(true);
         QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
         line->setFont(mono);
         return line;
+    }
+
+    void apply_stylesheet() {
+        QString style = R"(
+            QMainWindow {
+                background-color: #1e1e24;
+            }
+            QWidget {
+                color: #eceff4;
+                font-family: "Segoe UI", "Noto Sans", "Ubuntu", sans-serif;
+            }
+            QTabWidget::pane {
+                border: 1px solid #3b4252;
+                border-radius: 6px;
+                background-color: #24242b;
+                padding: 8px;
+            }
+            QTabBar::tab {
+                background-color: #2e3440;
+                color: #d8dee9;
+                border: 1px solid #3b4252;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 8px 18px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background-color: #5e81ac;
+                color: #ffffff;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #3b4252;
+            }
+            QGroupBox {
+                background-color: #2e3440;
+                border: 1px solid #3b4252;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 10px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+                color: #88c0d0;
+            }
+            QPushButton {
+                background-color: #5e81ac;
+                color: #ffffff;
+                border: none;
+                border-radius: 5px;
+                padding: 6px 14px;
+                min-width: 70px;
+            }
+            QPushButton:hover {
+                background-color: #81a1c1;
+            }
+            QPushButton:pressed {
+                background-color: #4c566a;
+            }
+            QPushButton:disabled {
+                background-color: #4c566a;
+                color: #a0a0a0;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                background-color: #3b4252;
+                border: 1px solid #4c566a;
+                border-radius: 4px;
+                padding: 4px;
+                color: #eceff4;
+            }
+            QLineEdit:read-only {
+                background-color: #2e3440;
+            }
+            QLabel {
+                color: #d8dee9;
+            }
+            QCheckBox {
+                color: #d8dee9;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QPlainTextEdit {
+                background-color: #2e3440;
+                border: 1px solid #3b4252;
+                border-radius: 6px;
+                color: #d8dee9;
+                font-family: monospace;
+            }
+            QTableWidget {
+                background-color: #2e3440;
+                border: 1px solid #3b4252;
+                border-radius: 6px;
+                gridline-color: #4c566a;
+                color: #d8dee9;
+            }
+            QTableWidget::item:selected {
+                background-color: #5e81ac;
+            }
+            QHeaderView::section {
+                background-color: #3b4252;
+                color: #eceff4;
+                padding: 6px;
+                border: 1px solid #4c566a;
+                font-weight: 600;
+            }
+            QToolButton {
+                background-color: transparent;
+                border: none;
+                color: #88c0d0;
+                font-weight: 600;
+            }
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+        )";
+        qApp->setStyleSheet(style);
     }
 
     int row_min_width(const std::initializer_list<QWidget *> &widgets, const QBoxLayout *layout) const {
@@ -2038,6 +2615,20 @@ protected:
         } else {
             cpu_freq_->setText("-");
         }
+
+        // Create per-core ratio rows without needing root. Types are refined later by refresh().
+        if (!per_core_rows_populated_ && per_core_grid_) {
+            int logical = info.logical_cpus > 0 ? info.logical_cpus : QThread::idealThreadCount();
+            if (logical <= 0) {
+                logical = 1;
+            }
+            QList<int> cpus;
+            for (int i = 0; i < logical; ++i) {
+                cpus.append(i);
+            }
+            populate_per_core_rows(cpus, "?");
+            per_core_rows_populated_ = true;
+        }
     }
 
     static int count_list(const QString &list) {
@@ -2100,6 +2691,28 @@ protected:
         e_cpus_->setText(state.e_cpus.isEmpty() ? "-" : state.e_cpus);
         u_cpus_->setText(state.u_cpus.isEmpty() ? "-" : state.u_cpus);
 
+        if (!per_core_rows_populated_ && per_core_grid_) {
+            // Fallback: if cpuinfo enumeration failed, populate from helper lists.
+            QList<int> p_cpus = parse_cpu_list(state.p_cpus);
+            QList<int> e_cpus = parse_cpu_list(state.e_cpus);
+            QList<int> u_cpus = parse_cpu_list(state.u_cpus);
+            int max_cpu = 0;
+            for (int cpu : p_cpus + e_cpus + u_cpus) {
+                max_cpu = std::max(max_cpu, cpu);
+            }
+            if (max_cpu > 0) {
+                QList<int> all;
+                for (int i = 0; i <= max_cpu; ++i) {
+                    all.append(i);
+                }
+                populate_per_core_rows(all, "?");
+                per_core_rows_populated_ = true;
+            }
+        }
+        if (per_core_rows_populated_) {
+            reset_per_core_ratios();
+        }
+
         int p_count = count_list(state.p_cpus);
         int e_count = count_list(state.e_cpus);
         cpu_p_count_->setText(p_count > 0 ? QString::number(p_count) : "-");
@@ -2136,6 +2749,34 @@ protected:
 
         cpu_p_mhz_->setText(format_mhz_stats(parse_cpu_list(state.p_cpus)));
         cpu_e_mhz_->setText(format_mhz_stats(parse_cpu_list(state.e_cpus)));
+
+        // Update per-core type labels from the helper's P/E/U lists.
+        if (per_core_rows_populated_) {
+            QSet<int> p_set;
+            QSet<int> e_set;
+            QSet<int> u_set;
+            for (int cpu : parse_cpu_list(state.p_cpus)) {
+                p_set.insert(cpu);
+            }
+            for (int cpu : parse_cpu_list(state.e_cpus)) {
+                e_set.insert(cpu);
+            }
+            for (int cpu : parse_cpu_list(state.u_cpus)) {
+                u_set.insert(cpu);
+            }
+            for (PerCoreRow &row : per_core_rows_) {
+                if (!row.type_label) {
+                    continue;
+                }
+                if (p_set.contains(row.cpu)) {
+                    row.type_label->setText("P");
+                } else if (e_set.contains(row.cpu)) {
+                    row.type_label->setText("E");
+                } else if (u_set.contains(row.cpu)) {
+                    row.type_label->setText("U");
+                }
+            }
+        }
 
         if (state.core_uv_valid) {
             if (!did_init_core_uv_) {
@@ -2427,11 +3068,337 @@ protected:
         }
     }
 
+    void build_per_core_ratio_section(int spacing) {
+        per_core_group_ = new QGroupBox();
+        per_core_group_->setFlat(true);
+        auto *outer_layout = new QVBoxLayout();
+        outer_layout->setSpacing(spacing);
+
+        auto *header = new QHBoxLayout();
+        header->setSpacing(spacing);
+        QLabel *header_label = new QLabel("Set a target ratio for each logical CPU. Current ratios update on Refresh.");
+        header_label->setWordWrap(true);
+        header->addWidget(header_label, 1);
+
+        per_core_apply_all_btn_ = new QPushButton("Apply all");
+        per_core_reset_btn_ = new QPushButton("Reset to P/E");
+        header->addWidget(per_core_apply_all_btn_);
+        header->addWidget(per_core_reset_btn_);
+        outer_layout->addLayout(header);
+
+        per_core_grid_ = new QGridLayout();
+        per_core_grid_->setSpacing(spacing);
+        per_core_grid_->setVerticalSpacing(spacing);
+        per_core_grid_->setHorizontalSpacing(spacing * 2);
+
+        per_core_grid_->addWidget(new QLabel("CPU"), 0, 0, Qt::AlignCenter);
+        per_core_grid_->addWidget(new QLabel("Type"), 0, 1, Qt::AlignCenter);
+        per_core_grid_->addWidget(new QLabel("Current"), 0, 2, Qt::AlignCenter);
+        per_core_grid_->addWidget(new QLabel("Target"), 0, 3, Qt::AlignCenter);
+        per_core_grid_->addWidget(new QLabel(""), 0, 4);
+
+        auto *grid_container = new QWidget();
+        grid_container->setLayout(per_core_grid_);
+        outer_layout->addWidget(grid_container, 1);
+
+        per_core_group_->setLayout(outer_layout);
+        per_core_section_ = new CollapsibleSection("Per-core ratios", per_core_group_, spacing);
+
+        connect(per_core_apply_all_btn_, &QPushButton::clicked, this, &MainWindow::apply_all_per_core_ratios);
+        connect(per_core_reset_btn_, &QPushButton::clicked, this, &MainWindow::reset_per_core_ratios);
+    }
+
+    void populate_per_core_rows(const QList<int> &cpus, const QString &type) {
+        for (int cpu : cpus) {
+            if (cpu < 0) {
+                continue;
+            }
+            int row = static_cast<int>(per_core_rows_.size()) + 1;
+            PerCoreRow r;
+            r.cpu = cpu;
+
+            QLabel *cpu_label = new QLabel(QString::number(cpu));
+            cpu_label->setAlignment(Qt::AlignCenter);
+            r.type_label = new QLabel(type);
+            r.type_label->setAlignment(Qt::AlignCenter);
+            r.cur_label = new QLabel("-");
+            r.cur_label->setAlignment(Qt::AlignCenter);
+
+            r.target_spin = new QSpinBox();
+            r.target_spin->setRange(1, 255);
+            r.target_spin->setSingleStep(1);
+            r.target_spin->setAlignment(Qt::AlignCenter);
+            r.target_spin->setMinimumWidth(70);
+
+            r.set_btn = new QPushButton("Set");
+            r.set_btn->setProperty("cpu", cpu);
+            connect(r.set_btn, &QPushButton::clicked, this, [this, cpu]() {
+                apply_per_core_ratio(cpu);
+            });
+
+            per_core_grid_->addWidget(cpu_label, row, 0);
+            per_core_grid_->addWidget(r.type_label, row, 1);
+            per_core_grid_->addWidget(r.cur_label, row, 2);
+            per_core_grid_->addWidget(r.target_spin, row, 3);
+            per_core_grid_->addWidget(r.set_btn, row, 4);
+
+            per_core_rows_.append(r);
+        }
+    }
+
+    void build_sensors_tab() {
+        sensors_tab_ = new QWidget();
+        auto *layout = new QVBoxLayout(sensors_tab_);
+        layout->setContentsMargins(12, 12, 12, 12);
+        layout->setSpacing(12);
+
+        auto *info = new QLabel("Sensors update only while this tab is visible.");
+        QFont info_font = info->font();
+        info_font.setItalic(true);
+        info->setFont(info_font);
+        layout->addWidget(info);
+
+        sensors_table_ = new QTableWidget();
+        sensors_table_->setColumnCount(7);
+        sensors_table_->setHorizontalHeaderLabels({"CPU", "Type", "Target", "Ratio", "Clock MHz", "Temp °C", "Throttle"});
+        sensors_table_->horizontalHeader()->setStretchLastSection(true);
+        sensors_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        sensors_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        sensors_table_->setAlternatingRowColors(true);
+        sensors_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        layout->addWidget(sensors_table_, 1);
+
+        auto *footer = new QHBoxLayout();
+        footer->addStretch();
+        sensors_status_label_ = new QLabel("Waiting...");
+        footer->addWidget(sensors_status_label_);
+        layout->addLayout(footer);
+
+        sensor_timer_ = new QTimer(this);
+        sensor_timer_->setInterval(1000);
+        connect(sensor_timer_, &QTimer::timeout, this, &MainWindow::update_sensors);
+    }
+
+    void update_sensor_row(SensorRow &row, const CoreSensor *sensor) {
+        double mhz = read_current_mhz_for_cpu(row.cpu);
+        if (mhz > 0.0) {
+            row.freq_item->setText(QString::number(std::llround(mhz)));
+        } else {
+            row.freq_item->setText("-");
+        }
+
+        int temp_md = -1;
+        int phys_core = physical_core_for_cpu(row.cpu);
+        if (phys_core >= 0) {
+            for (const HwmonTemp &t : coretemp_inputs_) {
+                if (t.label.compare(QString("Core %1").arg(phys_core), Qt::CaseInsensitive) == 0) {
+                    temp_md = read_temp_millidegrees(t.input_path);
+                    break;
+                }
+            }
+        }
+        if (temp_md < 0) {
+            // fallback: match by logical cpu label
+            for (const HwmonTemp &t : coretemp_inputs_) {
+                if (t.label.compare(QString("Core %1").arg(row.cpu), Qt::CaseInsensitive) == 0 ||
+                    t.label.compare(QString("CPU %1").arg(row.cpu), Qt::CaseInsensitive) == 0) {
+                    temp_md = read_temp_millidegrees(t.input_path);
+                    break;
+                }
+            }
+        }
+        if (temp_md > 0) {
+            row.temp_item->setText(QString::number(temp_md / 1000));
+        } else {
+            row.temp_item->setText("-");
+        }
+
+        if (sensor) {
+            row.type_item->setText(QString(sensor->type));
+            row.ratio_item->setText(sensor->ratio_valid ? QString("x%1").arg(sensor->ratio) : "-");
+            if (sensor->thermal_valid) {
+                row.throttle_item->setText(thermal_status_summary(sensor->thermal));
+            } else {
+                row.throttle_item->setText("-");
+            }
+        } else {
+            row.ratio_item->setText("-");
+            row.throttle_item->setText("-");
+        }
+
+        // target ratio from per-core spin boxes if present
+        for (const PerCoreRow &pc : per_core_rows_) {
+            if (pc.cpu == row.cpu && pc.target_spin) {
+                row.target_item->setText(QString("x%1").arg(pc.target_spin->value()));
+                break;
+            }
+        }
+    }
+
+    void refresh_sensor_table_structure() {
+        coretemp_inputs_ = discover_coretemp_inputs();
+        sensor_rows_.clear();
+        sensors_table_->setRowCount(0);
+
+        CpuInfo info = read_cpu_info();
+        int logical = info.logical_cpus > 0 ? info.logical_cpus : QThread::idealThreadCount();
+        if (logical <= 0) {
+            logical = 1;
+        }
+
+        QList<int> cpus;
+        for (int i = 0; i < logical; ++i) {
+            if (QFile::exists(QString("/sys/devices/system/cpu/cpu%1").arg(i))) {
+                cpus.append(i);
+            }
+        }
+        if (cpus.isEmpty()) {
+            for (int i = 0; i < logical; ++i) {
+                cpus.append(i);
+            }
+        }
+
+        sensors_table_->setRowCount(cpus.size());
+        for (int i = 0; i < cpus.size(); ++i) {
+            int cpu = cpus[i];
+            SensorRow row;
+            row.cpu = cpu;
+            row.type_item = new QTableWidgetItem("?");
+            row.target_item = new QTableWidgetItem("-");
+            row.ratio_item = new QTableWidgetItem("-");
+            row.freq_item = new QTableWidgetItem("-");
+            row.temp_item = new QTableWidgetItem("-");
+            row.throttle_item = new QTableWidgetItem("-");
+
+            sensors_table_->setItem(i, 0, new QTableWidgetItem(QString::number(cpu)));
+            sensors_table_->setItem(i, 1, row.type_item);
+            sensors_table_->setItem(i, 2, row.target_item);
+            sensors_table_->setItem(i, 3, row.ratio_item);
+            sensors_table_->setItem(i, 4, row.freq_item);
+            sensors_table_->setItem(i, 5, row.temp_item);
+            sensors_table_->setItem(i, 6, row.throttle_item);
+
+            for (int col = 0; col < sensors_table_->columnCount(); ++col) {
+                QTableWidgetItem *it = sensors_table_->item(i, col);
+                if (it) {
+                    it->setTextAlignment(Qt::AlignCenter);
+                }
+            }
+
+            sensor_rows_.append(row);
+        }
+    }
+
+    void maybe_start_sensor_timer() {
+        if (!sensor_timer_) {
+            return;
+        }
+        bool should_run = isVisible() && !isMinimized() && tab_widget_ && tab_widget_->currentIndex() == 1;
+        if (should_run && !sensor_timer_->isActive()) {
+            sensor_timer_->start();
+            update_sensors();
+        } else if (!should_run && sensor_timer_->isActive()) {
+            sensor_timer_->stop();
+        }
+    }
+
+    void apply_per_core_ratio(int cpu) {
+        int ratio = 0;
+        for (const PerCoreRow &row : per_core_rows_) {
+            if (row.cpu == cpu && row.target_spin) {
+                ratio = row.target_spin->value();
+                break;
+            }
+        }
+        if (ratio <= 0) {
+            return;
+        }
+        QString err;
+        if (!backend_.set_cpu_ratio(cpu, ratio, &err)) {
+            show_error(QString("Set CPU %1 ratio failed").arg(cpu), err);
+            return;
+        }
+        log_message(QString("Set CPU %1 ratio x%2").arg(cpu).arg(ratio));
+    }
+
+    void apply_all_per_core_ratios() {
+        for (const PerCoreRow &row : per_core_rows_) {
+            if (row.cpu >= 0 && row.target_spin) {
+                int ratio = row.target_spin->value();
+                QString err;
+                if (!backend_.set_cpu_ratio(row.cpu, ratio, &err)) {
+                    show_error(QString("Set CPU %1 ratio failed").arg(row.cpu), err);
+                    return;
+                }
+            }
+        }
+        log_message("Applied per-core ratios.");
+    }
+
+    void reset_per_core_ratios() {
+        int p_default = p_ratio_spin_->value();
+        int e_default = e_ratio_spin_->value();
+        for (PerCoreRow &row : per_core_rows_) {
+            if (!row.target_spin) {
+                continue;
+            }
+            if (row.type_label) {
+                QString t = row.type_label->text();
+                if (t == "E" && e_default > 0) {
+                    row.target_spin->setValue(e_default);
+                } else if (p_default > 0) {
+                    row.target_spin->setValue(p_default);
+                }
+            }
+        }
+    }
+
+    void update_sensors() {
+        if (!backend_ready_) {
+            sensors_status_label_->setText("Backend not ready");
+            return;
+        }
+        if (sensor_rows_.isEmpty()) {
+            refresh_sensor_table_structure();
+        }
+
+        QString err;
+        QList<CoreSensor> sensors;
+        if (!backend_.read_core_sensors(sensors, &err)) {
+            sensors_status_label_->setText("Read failed: " + err);
+            return;
+        }
+
+        QHash<int, const CoreSensor *> by_cpu;
+        for (const CoreSensor &s : sensors) {
+            by_cpu.insert(s.cpu, &s);
+        }
+
+        for (SensorRow &row : sensor_rows_) {
+            update_sensor_row(row, by_cpu.value(row.cpu, nullptr));
+        }
+
+        for (PerCoreRow &row : per_core_rows_) {
+            const CoreSensor *s = by_cpu.value(row.cpu, nullptr);
+            if (s && s->ratio_valid && row.cur_label) {
+                row.cur_label->setText(QString("x%1").arg(s->ratio));
+            }
+        }
+
+        sensors_status_label_->setText(QString("Updated %1 cores").arg(sensor_rows_.size()));
+    }
+
     HelperBackend backend_;
     int power_unit_ = 0;
     double unit_watts_ = 0.0;
     bool did_init_limits_ = false;
     bool did_init_core_uv_ = false;
+    bool quitting_ = false;
+
+    QSystemTrayIcon *tray_icon_ = nullptr;
+    QMenu *tray_menu_ = nullptr;
+    QAction *tray_show_action_ = nullptr;
+    QAction *tray_quit_action_ = nullptr;
 
     QGroupBox *cpu_group_ = nullptr;
     QGridLayout *cpu_grid_ = nullptr;
@@ -2510,6 +3477,8 @@ protected:
     QCheckBox *startup_apply_ratios_ = nullptr;
     QComboBox *startup_ratio_target_ = nullptr;
     QCheckBox *startup_apply_core_uv_ = nullptr;
+    QCheckBox *close_to_tray_ = nullptr;
+    QCheckBox *autostart_enabled_ = nullptr;
 
     QGroupBox *set_group_ = nullptr;
     CollapsibleSection *cpu_section_ = nullptr;
@@ -2531,7 +3500,7 @@ protected:
     QGroupBox *tuned_ppd_controls_ = nullptr;
     QGroupBox *profile_group_ = nullptr;
     QWidget *central_ = nullptr;
-    QScrollArea *scroll_area_ = nullptr;
+    QTabWidget *tab_widget_ = nullptr;
 
     QPlainTextEdit *log_ = nullptr;
 
@@ -2552,6 +3521,21 @@ protected:
     std::vector<Row> profile_rows_;
     std::vector<Row> startup_rows_;
 
+    CollapsibleSection *per_core_section_ = nullptr;
+    QGroupBox *per_core_group_ = nullptr;
+    QGridLayout *per_core_grid_ = nullptr;
+    QPushButton *per_core_apply_all_btn_ = nullptr;
+    QPushButton *per_core_reset_btn_ = nullptr;
+    QList<PerCoreRow> per_core_rows_;
+    bool per_core_rows_populated_ = false;
+
+    QWidget *sensors_tab_ = nullptr;
+    QTableWidget *sensors_table_ = nullptr;
+    QLabel *sensors_status_label_ = nullptr;
+    QTimer *sensor_timer_ = nullptr;
+    QList<SensorRow> sensor_rows_;
+    QList<HwmonTemp> coretemp_inputs_;
+
     bool loading_prefs_ = false;
     bool startup_guard_set_ = false;
     bool backend_ready_ = false;
@@ -2569,6 +3553,8 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName("limits_droper");
     QCoreApplication::setApplicationName("limits_ui_qt");
+    QApplication::setDesktopFileName("limits_droper");
+    app.setQuitOnLastWindowClosed(false);
     MainWindow window;
     window.show();
     return app.exec();

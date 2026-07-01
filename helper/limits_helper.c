@@ -24,6 +24,7 @@
 #define MSR_OC_MAILBOX       0x150
 #define MSR_IA32_PERF_CTL     0x199
 #define MSR_IA32_PERF_STATUS  0x198
+#define MSR_IA32_THERM_STATUS 0x19C
 #define MSR_RAPL_POWER_UNIT  0x606
 #define MSR_PKG_POWER_LIMIT  0x610
 
@@ -483,6 +484,21 @@ static int set_ratio_on_cpu(int cpu, uint8_t ratio) {
     return 0;
 }
 
+static int read_thermal_status_on_cpu(int cpu, uint64_t *thermal_out) {
+    int fd = open_msr_cpu(cpu, false);
+    if (fd < 0) {
+        return -1;
+    }
+    uint64_t val = 0;
+    if (rdmsr(fd, MSR_IA32_THERM_STATUS, &val) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    *thermal_out = val;
+    return 0;
+}
+
 static int apply_ratio_list(const struct cpu_list *list, uint8_t ratio) {
     for (size_t i = 0; i < list->count; i++) {
         if (set_ratio_on_cpu(list->ids[i], ratio) != 0) {
@@ -549,10 +565,611 @@ static void usage(const char *argv0) {
         "  %s --set-e-ratio <int>\n"
         "  %s --set-all-ratio <int>\n"
         "  %s --set-pe-ratio <p_int> <e_int>\n"
-        "  %s --set-core-uv <mV>\n",
+        "  %s --set-cpu-ratio <cpu> <ratio>\n"
+        "  %s --set-core-uv <mV>\n"
+        "  %s --read-core-sensors\n"
+        "  %s --server\n",
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
+
+static void print_end(void) {
+    printf("END\n");
+    fflush(stdout);
+}
+
+static int cmd_read(void) {
+    int msr_fd = open_msr(true);
+    if (msr_fd < 0) {
+        fprintf(stderr, "open(/dev/cpu/0/msr) failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    volatile uint8_t *mmio = NULL;
+    char mmio_err[256] = {0};
+    int mem_fd = open_mmio(false, &mmio, mmio_err, sizeof(mmio_err));
+    if (mem_fd < 0) {
+        fprintf(stderr, "open MMIO failed: %s\n", mmio_err[0] ? mmio_err : "unknown error");
+        close(msr_fd);
+        return 1;
+    }
+
+    uint64_t rapl_units = 0;
+    uint64_t msr_val = 0;
+    uint64_t mmio_val = 0;
+
+    if (rdmsr(msr_fd, MSR_RAPL_POWER_UNIT, &rapl_units) != 0) {
+        fprintf(stderr, "read MSR 0x%X failed: %s\n", MSR_RAPL_POWER_UNIT, strerror(errno));
+        close_mmio(mem_fd, mmio);
+        close(msr_fd);
+        return 1;
+    }
+
+    if (rdmsr(msr_fd, MSR_PKG_POWER_LIMIT, &msr_val) != 0) {
+        fprintf(stderr, "read MSR 0x%X failed: %s\n", MSR_PKG_POWER_LIMIT, strerror(errno));
+        close_mmio(mem_fd, mmio);
+        close(msr_fd);
+        return 1;
+    }
+
+    mmio_val = rd64(mmio, PL_OFF);
+
+    struct cpu_list p_list;
+    struct cpu_list e_list;
+    struct cpu_list u_list;
+    cpu_list_init(&p_list);
+    cpu_list_init(&e_list);
+    cpu_list_init(&u_list);
+    int core_type_ok = 0;
+    if (enumerate_cpus(&p_list, &e_list, &u_list, &core_type_ok) != 0) {
+        fprintf(stderr, "Failed to enumerate CPUs\n");
+        close_mmio(mem_fd, mmio);
+        close(msr_fd);
+        cpu_list_free(&p_list);
+        cpu_list_free(&e_list);
+        cpu_list_free(&u_list);
+        return 1;
+    }
+
+    uint8_t p_ratio = 0;
+    uint8_t e_ratio = 0;
+    int p_ratio_valid = 0;
+    int e_ratio_valid = 0;
+    uint8_t p_ratio_cur = 0;
+    uint8_t e_ratio_cur = 0;
+    int p_ratio_cur_valid = 0;
+    int e_ratio_cur_valid = 0;
+    if (p_list.count > 0 && read_ratio_on_cpu(p_list.ids[0], &p_ratio) == 0) {
+        p_ratio_valid = 1;
+    }
+    if (e_list.count > 0 && read_ratio_on_cpu(e_list.ids[0], &e_ratio) == 0) {
+        e_ratio_valid = 1;
+    }
+    if (p_list.count > 0 && read_ratio_current_on_cpu(p_list.ids[0], &p_ratio_cur) == 0) {
+        p_ratio_cur_valid = 1;
+    }
+    if (e_list.count > 0 && read_ratio_current_on_cpu(e_list.ids[0], &e_ratio_cur) == 0) {
+        e_ratio_cur_valid = 1;
+    }
+
+    uint32_t core_uv_raw = 0;
+    int core_uv_valid = 0;
+    double core_uv_mv = 0.0;
+    if (oc_mailbox_read(msr_fd, OC_PLANE_CORE, &core_uv_raw) == 0) {
+        core_uv_valid = 1;
+        core_uv_mv = oc_decode_offset_mv(core_uv_raw);
+    }
+
+    int power_unit = (int)(rapl_units & 0x0F);
+    double unit_watts = 1.0 / (double)(1u << power_unit);
+
+    printf("POWER_UNIT=%d\n", power_unit);
+    printf("UNIT_WATTS=%.12f\n", unit_watts);
+    printf("MSR=0x%016" PRIx64 "\n", msr_val);
+    printf("MMIO=0x%016" PRIx64 "\n", mmio_val);
+    printf("CORE_TYPE_SUPPORTED=%d\n", core_type_ok);
+    print_cpu_list("P_CPUS", &p_list);
+    print_cpu_list("E_CPUS", &e_list);
+    print_cpu_list("U_CPUS", &u_list);
+    printf("P_RATIO_VALID=%d\n", p_ratio_valid);
+    printf("E_RATIO_VALID=%d\n", e_ratio_valid);
+    printf("P_RATIO_TARGET=%u\n", p_ratio);
+    printf("E_RATIO_TARGET=%u\n", e_ratio);
+    printf("P_RATIO_CUR_VALID=%d\n", p_ratio_cur_valid);
+    printf("E_RATIO_CUR_VALID=%d\n", e_ratio_cur_valid);
+    printf("P_RATIO_CUR=%u\n", p_ratio_cur);
+    printf("E_RATIO_CUR=%u\n", e_ratio_cur);
+    printf("CORE_UV_VALID=%d\n", core_uv_valid);
+    printf("CORE_UV_MV=%.3f\n", core_uv_mv);
+    printf("CORE_UV_RAW=0x%08" PRIx32 "\n", core_uv_raw);
+
+    close_mmio(mem_fd, mmio);
+    close(msr_fd);
+    cpu_list_free(&p_list);
+    cpu_list_free(&e_list);
+    cpu_list_free(&u_list);
+    return 0;
+}
+
+static int cmd_write_msr(uint64_t val) {
+    int msr_fd = open_msr(true);
+    if (msr_fd < 0) {
+        fprintf(stderr, "open(/dev/cpu/0/msr) failed: %s\n", strerror(errno));
+        return 1;
+    }
+    if (wrmsr(msr_fd, MSR_PKG_POWER_LIMIT, val) != 0) {
+        fprintf(stderr, "write MSR 0x%X failed: %s\n", MSR_PKG_POWER_LIMIT, strerror(errno));
+        close(msr_fd);
+        return 1;
+    }
+    close(msr_fd);
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_write_mmio(uint64_t val) {
+    volatile uint8_t *mmio = NULL;
+    char mmio_err[256] = {0};
+    int mem_fd = open_mmio(true, &mmio, mmio_err, sizeof(mmio_err));
+    if (mem_fd < 0) {
+        fprintf(stderr, "open MMIO failed: %s\n", mmio_err[0] ? mmio_err : "unknown error");
+        return 1;
+    }
+    wr64(mmio, PL_OFF, val);
+    close_mmio(mem_fd, mmio);
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_write_powercap(uint64_t pl1_uw, uint64_t pl2_uw) {
+    char err[256] = {0};
+    if (write_powercap_uw(pl1_uw, pl2_uw, err, sizeof(err)) != 0) {
+        fprintf(stderr, "Failed to write powercap: %s\n", err[0] ? err : "unknown error");
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_service(const char *action, bool with_now, const char *service_name) {
+    const char *services[] = {service_name};
+    char err[256] = {0};
+    if (run_systemctl_action(action, with_now, services, 1, err, sizeof(err)) != 0) {
+        fprintf(stderr, "systemctl %s failed: %s\n", action, err[0] ? err : "unknown error");
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_set_ratio_list(const struct cpu_list *list, uint8_t ratio, const char *label) {
+    if (list->count == 0) {
+        fprintf(stderr, "No %s cores detected\n", label);
+        return 1;
+    }
+    if (apply_ratio_list(list, ratio) != 0) {
+        fprintf(stderr, "Failed to apply ratio\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_set_p_ratio(int ratio) {
+    struct cpu_list p_list, e_list, u_list;
+    cpu_list_init(&p_list);
+    cpu_list_init(&e_list);
+    cpu_list_init(&u_list);
+    if (enumerate_cpus(&p_list, &e_list, &u_list, NULL) != 0) {
+        fprintf(stderr, "Failed to enumerate CPUs\n");
+        cpu_list_free(&p_list);
+        cpu_list_free(&e_list);
+        cpu_list_free(&u_list);
+        return 1;
+    }
+    int rc = cmd_set_ratio_list(&p_list, (uint8_t)ratio, "P");
+    cpu_list_free(&p_list);
+    cpu_list_free(&e_list);
+    cpu_list_free(&u_list);
+    if (rc == 0) {
+        printf("OK\n");
+    }
+    return rc;
+}
+
+static int cmd_set_e_ratio(int ratio) {
+    struct cpu_list p_list, e_list, u_list;
+    cpu_list_init(&p_list);
+    cpu_list_init(&e_list);
+    cpu_list_init(&u_list);
+    if (enumerate_cpus(&p_list, &e_list, &u_list, NULL) != 0) {
+        fprintf(stderr, "Failed to enumerate CPUs\n");
+        cpu_list_free(&p_list);
+        cpu_list_free(&e_list);
+        cpu_list_free(&u_list);
+        return 1;
+    }
+    int rc = cmd_set_ratio_list(&e_list, (uint8_t)ratio, "E");
+    cpu_list_free(&p_list);
+    cpu_list_free(&e_list);
+    cpu_list_free(&u_list);
+    if (rc == 0) {
+        printf("OK\n");
+    }
+    return rc;
+}
+
+static int cmd_set_all_ratio(int ratio) {
+    struct cpu_list p_list, e_list, u_list;
+    cpu_list_init(&p_list);
+    cpu_list_init(&e_list);
+    cpu_list_init(&u_list);
+    if (enumerate_cpus(&p_list, &e_list, &u_list, NULL) != 0) {
+        fprintf(stderr, "Failed to enumerate CPUs\n");
+        cpu_list_free(&p_list);
+        cpu_list_free(&e_list);
+        cpu_list_free(&u_list);
+        return 1;
+    }
+    int rc = 0;
+    if (cmd_set_ratio_list(&p_list, (uint8_t)ratio, "P") != 0) {
+        rc = 1;
+    }
+    if (cmd_set_ratio_list(&e_list, (uint8_t)ratio, "E") != 0) {
+        rc = 1;
+    }
+    if (cmd_set_ratio_list(&u_list, (uint8_t)ratio, "U") != 0) {
+        rc = 1;
+    }
+    cpu_list_free(&p_list);
+    cpu_list_free(&e_list);
+    cpu_list_free(&u_list);
+    if (rc == 0) {
+        printf("OK\n");
+    }
+    return rc;
+}
+
+static int cmd_set_pe_ratio(int ratio_p, int ratio_e) {
+    struct cpu_list p_list, e_list, u_list;
+    cpu_list_init(&p_list);
+    cpu_list_init(&e_list);
+    cpu_list_init(&u_list);
+    if (enumerate_cpus(&p_list, &e_list, &u_list, NULL) != 0) {
+        fprintf(stderr, "Failed to enumerate CPUs\n");
+        cpu_list_free(&p_list);
+        cpu_list_free(&e_list);
+        cpu_list_free(&u_list);
+        return 1;
+    }
+    int rc = 0;
+    if (cmd_set_ratio_list(&p_list, (uint8_t)ratio_p, "P") != 0) {
+        rc = 1;
+    }
+    if (cmd_set_ratio_list(&e_list, (uint8_t)ratio_e, "E") != 0) {
+        rc = 1;
+    }
+    cpu_list_free(&p_list);
+    cpu_list_free(&e_list);
+    cpu_list_free(&u_list);
+    if (rc == 0) {
+        printf("OK\n");
+    }
+    return rc;
+}
+
+static int cmd_set_cpu_ratio(int cpu, int ratio) {
+    if (set_ratio_on_cpu(cpu, (uint8_t)ratio) != 0) {
+        fprintf(stderr, "Failed to set ratio on cpu %d\n", cpu);
+        return 1;
+    }
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_read_core_sensors(void) {
+    struct cpu_list p_list;
+    struct cpu_list e_list;
+    struct cpu_list u_list;
+    cpu_list_init(&p_list);
+    cpu_list_init(&e_list);
+    cpu_list_init(&u_list);
+    int core_type_ok = 0;
+    if (enumerate_cpus(&p_list, &e_list, &u_list, &core_type_ok) != 0) {
+        fprintf(stderr, "Failed to enumerate CPUs\n");
+        cpu_list_free(&p_list);
+        cpu_list_free(&e_list);
+        cpu_list_free(&u_list);
+        return 1;
+    }
+
+    size_t total = p_list.count + e_list.count + u_list.count;
+    printf("CORE_SENSOR_COUNT=%zu\n", total);
+
+    size_t idx = 0;
+    for (size_t i = 0; i < p_list.count; i++, idx++) {
+        int cpu = p_list.ids[i];
+        uint8_t ratio = 0;
+        uint64_t thermal = 0;
+        int ratio_ok = read_ratio_current_on_cpu(cpu, &ratio) == 0;
+        int thermal_ok = read_thermal_status_on_cpu(cpu, &thermal) == 0;
+        printf("CORE_SENSOR_%zu=cpu=%d,type=P,ratio=%u,thermal=0x%016" PRIx64 "\n",
+               idx,
+               cpu,
+               ratio_ok ? (unsigned int)ratio : 0u,
+               thermal_ok ? thermal : (uint64_t)0);
+        (void)ratio_ok;
+        (void)thermal_ok;
+    }
+    for (size_t i = 0; i < e_list.count; i++, idx++) {
+        int cpu = e_list.ids[i];
+        uint8_t ratio = 0;
+        uint64_t thermal = 0;
+        int ratio_ok = read_ratio_current_on_cpu(cpu, &ratio) == 0;
+        int thermal_ok = read_thermal_status_on_cpu(cpu, &thermal) == 0;
+        printf("CORE_SENSOR_%zu=cpu=%d,type=E,ratio=%u,thermal=0x%016" PRIx64 "\n",
+               idx,
+               cpu,
+               ratio_ok ? (unsigned int)ratio : 0u,
+               thermal_ok ? thermal : (uint64_t)0);
+        (void)ratio_ok;
+        (void)thermal_ok;
+    }
+    for (size_t i = 0; i < u_list.count; i++, idx++) {
+        int cpu = u_list.ids[i];
+        uint8_t ratio = 0;
+        uint64_t thermal = 0;
+        int ratio_ok = read_ratio_current_on_cpu(cpu, &ratio) == 0;
+        int thermal_ok = read_thermal_status_on_cpu(cpu, &thermal) == 0;
+        printf("CORE_SENSOR_%zu=cpu=%d,type=U,ratio=%u,thermal=0x%016" PRIx64 "\n",
+               idx,
+               cpu,
+               ratio_ok ? (unsigned int)ratio : 0u,
+               thermal_ok ? thermal : (uint64_t)0);
+        (void)ratio_ok;
+        (void)thermal_ok;
+    }
+
+    cpu_list_free(&p_list);
+    cpu_list_free(&e_list);
+    cpu_list_free(&u_list);
+    return 0;
+}
+
+static int cmd_set_core_uv(double mv) {
+    if (mv < -500.0 || mv > 500.0) {
+        fprintf(stderr, "Refusing voltage offset outside [-500, 500] mV.\n");
+        return 2;
+    }
+
+    int msr_fd = open_msr(true);
+    if (msr_fd < 0) {
+        fprintf(stderr, "open(/dev/cpu/0/msr) failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    uint32_t raw = oc_encode_offset_mv(mv);
+    if (oc_mailbox_write(msr_fd, OC_PLANE_CORE, raw) != 0) {
+        fprintf(stderr, "write OC mailbox failed: %s\n", strerror(errno));
+        close(msr_fd);
+        return 1;
+    }
+
+    close(msr_fd);
+    printf("OK\n");
+    return 0;
+}
+
+static int dispatch_server_command(const char *line) {
+    // Make a mutable copy for tokenization.
+    char buf[4096];
+    size_t len = strlen(line);
+    if (len >= sizeof(buf)) {
+        fprintf(stderr, "Command too long\n");
+        return 1;
+    }
+    memcpy(buf, line, len + 1);
+
+    // Trim trailing newline.
+    if (len > 0 && buf[len - 1] == '\n') {
+        buf[len - 1] = '\0';
+    }
+    if (len > 1 && buf[len - 2] == '\r') {
+        buf[len - 2] = '\0';
+    }
+
+    char *save = NULL;
+    char *cmd = strtok_r(buf, " \t", &save);
+    if (!cmd) {
+        return 1;
+    }
+
+    if (strcmp(cmd, "READ") == 0) {
+        return cmd_read();
+    }
+    if (strcmp(cmd, "READ-CORE-SENSORS") == 0) {
+        return cmd_read_core_sensors();
+    }
+    if (strcmp(cmd, "WRITE-MSR") == 0) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        if (!arg) {
+            fprintf(stderr, "Missing value\n");
+            return 2;
+        }
+        uint64_t val = 0;
+        if (!parse_u64(arg, &val)) {
+            fprintf(stderr, "Invalid value: %s\n", arg);
+            return 2;
+        }
+        return cmd_write_msr(val);
+    }
+    if (strcmp(cmd, "WRITE-MMIO") == 0) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        if (!arg) {
+            fprintf(stderr, "Missing value\n");
+            return 2;
+        }
+        uint64_t val = 0;
+        if (!parse_u64(arg, &val)) {
+            fprintf(stderr, "Invalid value: %s\n", arg);
+            return 2;
+        }
+        return cmd_write_mmio(val);
+    }
+    if (strcmp(cmd, "WRITE-POWERCAP") == 0) {
+        char *a1 = strtok_r(NULL, " \t", &save);
+        char *a2 = strtok_r(NULL, " \t", &save);
+        if (!a1 || !a2) {
+            fprintf(stderr, "Missing powercap values\n");
+            return 2;
+        }
+        uint64_t pl1_uw = 0;
+        uint64_t pl2_uw = 0;
+        if (!parse_u64(a1, &pl1_uw) || !parse_u64(a2, &pl2_uw) || pl1_uw == 0 || pl2_uw == 0) {
+            fprintf(stderr, "Invalid powercap values\n");
+            return 2;
+        }
+        return cmd_write_powercap(pl1_uw, pl2_uw);
+    }
+    if (strcmp(cmd, "START-THERMALD") == 0) {
+        return cmd_service("start", false, "thermald.service");
+    }
+    if (strcmp(cmd, "STOP-THERMALD") == 0) {
+        return cmd_service("stop", false, "thermald.service");
+    }
+    if (strcmp(cmd, "DISABLE-THERMALD") == 0) {
+        return cmd_service("disable", false, "thermald.service");
+    }
+    if (strcmp(cmd, "ENABLE-THERMALD") == 0) {
+        return cmd_service("enable", false, "thermald.service");
+    }
+    if (strcmp(cmd, "START-TUNED") == 0) {
+        return cmd_service("start", false, "tuned.service");
+    }
+    if (strcmp(cmd, "STOP-TUNED") == 0) {
+        return cmd_service("stop", false, "tuned.service");
+    }
+    if (strcmp(cmd, "DISABLE-TUNED") == 0) {
+        return cmd_service("disable", false, "tuned.service");
+    }
+    if (strcmp(cmd, "ENABLE-TUNED") == 0) {
+        return cmd_service("enable", false, "tuned.service");
+    }
+    if (strcmp(cmd, "START-TUNED-PPD") == 0) {
+        return cmd_service("start", false, "tuned-ppd.service");
+    }
+    if (strcmp(cmd, "STOP-TUNED-PPD") == 0) {
+        return cmd_service("stop", false, "tuned-ppd.service");
+    }
+    if (strcmp(cmd, "DISABLE-TUNED-PPD") == 0) {
+        return cmd_service("disable", false, "tuned-ppd.service");
+    }
+    if (strcmp(cmd, "ENABLE-TUNED-PPD") == 0) {
+        return cmd_service("enable", false, "tuned-ppd.service");
+    }
+    if (strcmp(cmd, "SET-P-RATIO") == 0) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        if (!arg) {
+            fprintf(stderr, "Missing ratio\n");
+            return 2;
+        }
+        int ratio = 0;
+        if (!parse_int(arg, &ratio) || ratio <= 0 || ratio > 255) {
+            fprintf(stderr, "Invalid ratio: %s\n", arg);
+            return 2;
+        }
+        return cmd_set_p_ratio(ratio);
+    }
+    if (strcmp(cmd, "SET-E-RATIO") == 0) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        if (!arg) {
+            fprintf(stderr, "Missing ratio\n");
+            return 2;
+        }
+        int ratio = 0;
+        if (!parse_int(arg, &ratio) || ratio <= 0 || ratio > 255) {
+            fprintf(stderr, "Invalid ratio: %s\n", arg);
+            return 2;
+        }
+        return cmd_set_e_ratio(ratio);
+    }
+    if (strcmp(cmd, "SET-ALL-RATIO") == 0) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        if (!arg) {
+            fprintf(stderr, "Missing ratio\n");
+            return 2;
+        }
+        int ratio = 0;
+        if (!parse_int(arg, &ratio) || ratio <= 0 || ratio > 255) {
+            fprintf(stderr, "Invalid ratio: %s\n", arg);
+            return 2;
+        }
+        return cmd_set_all_ratio(ratio);
+    }
+    if (strcmp(cmd, "SET-PE-RATIO") == 0) {
+        char *a1 = strtok_r(NULL, " \t", &save);
+        char *a2 = strtok_r(NULL, " \t", &save);
+        if (!a1 || !a2) {
+            fprintf(stderr, "Missing ratio values\n");
+            return 2;
+        }
+        int ratio_p = 0;
+        int ratio_e = 0;
+        if (!parse_int(a1, &ratio_p) || !parse_int(a2, &ratio_e) ||
+            ratio_p <= 0 || ratio_p > 255 || ratio_e <= 0 || ratio_e > 255) {
+            fprintf(stderr, "Invalid ratio values\n");
+            return 2;
+        }
+        return cmd_set_pe_ratio(ratio_p, ratio_e);
+    }
+    if (strcmp(cmd, "SET-CPU-RATIO") == 0) {
+        char *a1 = strtok_r(NULL, " \t", &save);
+        char *a2 = strtok_r(NULL, " \t", &save);
+        if (!a1 || !a2) {
+            fprintf(stderr, "Missing cpu or ratio\n");
+            return 2;
+        }
+        int cpu = 0;
+        int ratio = 0;
+        if (!parse_int(a1, &cpu) || !parse_int(a2, &ratio) ||
+            cpu < 0 || ratio <= 0 || ratio > 255) {
+            fprintf(stderr, "Invalid cpu or ratio values\n");
+            return 2;
+        }
+        return cmd_set_cpu_ratio(cpu, ratio);
+    }
+    if (strcmp(cmd, "SET-CORE-UV") == 0) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        if (!arg) {
+            fprintf(stderr, "Missing voltage offset\n");
+            return 2;
+        }
+        double mv = 0.0;
+        if (!parse_double(arg, &mv)) {
+            fprintf(stderr, "Invalid voltage offset: %s\n", arg);
+            return 2;
+        }
+        return cmd_set_core_uv(mv);
+    }
+    if (strcmp(cmd, "QUIT") == 0) {
+        return -1;
+    }
+
+    fprintf(stderr, "Unknown server command: %s\n", cmd);
+    return 2;
+}
+
+static int run_server(void) {
+    char line[4096];
+    while (fgets(line, sizeof(line), stdin)) {
+        int rc = dispatch_server_command(line);
+        if (rc == -1) {
+            break;
+        }
+        print_end();
+    }
+    return 0;
+}
+
 
 int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "--help") == 0) {
@@ -560,119 +1177,12 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    if (strcmp(argv[1], "--read") == 0) {
-        int msr_fd = open_msr(true);
-        if (msr_fd < 0) {
-            fprintf(stderr, "open(/dev/cpu/0/msr) failed: %s\n", strerror(errno));
-            return 1;
-        }
-
-        volatile uint8_t *mmio = NULL;
-        char mmio_err[256] = {0};
-        int mem_fd = open_mmio(false, &mmio, mmio_err, sizeof(mmio_err));
-        if (mem_fd < 0) {
-            fprintf(stderr, "open MMIO failed: %s\n", mmio_err[0] ? mmio_err : "unknown error");
-            close(msr_fd);
-            return 1;
-        }
-
-        uint64_t rapl_units = 0;
-        uint64_t msr_val = 0;
-        uint64_t mmio_val = 0;
-
-        if (rdmsr(msr_fd, MSR_RAPL_POWER_UNIT, &rapl_units) != 0) {
-            fprintf(stderr, "read MSR 0x%X failed: %s\n", MSR_RAPL_POWER_UNIT, strerror(errno));
-            close_mmio(mem_fd, mmio);
-            close(msr_fd);
-            return 1;
-        }
-
-        if (rdmsr(msr_fd, MSR_PKG_POWER_LIMIT, &msr_val) != 0) {
-            fprintf(stderr, "read MSR 0x%X failed: %s\n", MSR_PKG_POWER_LIMIT, strerror(errno));
-            close_mmio(mem_fd, mmio);
-            close(msr_fd);
-            return 1;
-        }
-
-        mmio_val = rd64(mmio, PL_OFF);
-
-        struct cpu_list p_list;
-        struct cpu_list e_list;
-        struct cpu_list u_list;
-        cpu_list_init(&p_list);
-        cpu_list_init(&e_list);
-        cpu_list_init(&u_list);
-        int core_type_ok = 0;
-        if (enumerate_cpus(&p_list, &e_list, &u_list, &core_type_ok) != 0) {
-            fprintf(stderr, "Failed to enumerate CPUs\n");
-            close_mmio(mem_fd, mmio);
-            close(msr_fd);
-            cpu_list_free(&p_list);
-            cpu_list_free(&e_list);
-            cpu_list_free(&u_list);
-            return 1;
-        }
-
-        uint8_t p_ratio = 0;
-        uint8_t e_ratio = 0;
-        int p_ratio_valid = 0;
-        int e_ratio_valid = 0;
-        uint8_t p_ratio_cur = 0;
-        uint8_t e_ratio_cur = 0;
-        int p_ratio_cur_valid = 0;
-        int e_ratio_cur_valid = 0;
-        if (p_list.count > 0 && read_ratio_on_cpu(p_list.ids[0], &p_ratio) == 0) {
-            p_ratio_valid = 1;
-        }
-        if (e_list.count > 0 && read_ratio_on_cpu(e_list.ids[0], &e_ratio) == 0) {
-            e_ratio_valid = 1;
-        }
-        if (p_list.count > 0 && read_ratio_current_on_cpu(p_list.ids[0], &p_ratio_cur) == 0) {
-            p_ratio_cur_valid = 1;
-        }
-        if (e_list.count > 0 && read_ratio_current_on_cpu(e_list.ids[0], &e_ratio_cur) == 0) {
-            e_ratio_cur_valid = 1;
-        }
-
-        uint32_t core_uv_raw = 0;
-        int core_uv_valid = 0;
-        double core_uv_mv = 0.0;
-        if (oc_mailbox_read(msr_fd, OC_PLANE_CORE, &core_uv_raw) == 0) {
-            core_uv_valid = 1;
-            core_uv_mv = oc_decode_offset_mv(core_uv_raw);
-        }
-
-        int power_unit = (int)(rapl_units & 0x0F);
-        double unit_watts = 1.0 / (double)(1u << power_unit);
-
-        printf("POWER_UNIT=%d\n", power_unit);
-        printf("UNIT_WATTS=%.12f\n", unit_watts);
-        printf("MSR=0x%016" PRIx64 "\n", msr_val);
-        printf("MMIO=0x%016" PRIx64 "\n", mmio_val);
-        printf("CORE_TYPE_SUPPORTED=%d\n", core_type_ok);
-        print_cpu_list("P_CPUS", &p_list);
-        print_cpu_list("E_CPUS", &e_list);
-        print_cpu_list("U_CPUS", &u_list);
-        printf("P_RATIO_VALID=%d\n", p_ratio_valid);
-        printf("E_RATIO_VALID=%d\n", e_ratio_valid);
-        printf("P_RATIO_TARGET=%u\n", p_ratio);
-        printf("E_RATIO_TARGET=%u\n", e_ratio);
-        printf("P_RATIO_CUR_VALID=%d\n", p_ratio_cur_valid);
-        printf("E_RATIO_CUR_VALID=%d\n", e_ratio_cur_valid);
-        printf("P_RATIO_CUR=%u\n", p_ratio_cur);
-        printf("E_RATIO_CUR=%u\n", e_ratio_cur);
-        printf("CORE_UV_VALID=%d\n", core_uv_valid);
-        printf("CORE_UV_MV=%.3f\n", core_uv_mv);
-        printf("CORE_UV_RAW=0x%08" PRIx32 "\n", core_uv_raw);
-
-        close_mmio(mem_fd, mmio);
-        close(msr_fd);
-        cpu_list_free(&p_list);
-        cpu_list_free(&e_list);
-        cpu_list_free(&u_list);
-        return 0;
+    if (strcmp(argv[1], "--server") == 0) {
+        return run_server();
     }
-
+    if (strcmp(argv[1], "--read") == 0) {
+        return cmd_read();
+    }
     if (strcmp(argv[1], "--write-msr") == 0) {
         if (argc < 3) {
             usage(argv[0]);
@@ -683,21 +1193,20 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Invalid value: %s\n", argv[2]);
             return 2;
         }
-        int msr_fd = open_msr(true);
-        if (msr_fd < 0) {
-            fprintf(stderr, "open(/dev/cpu/0/msr) failed: %s\n", strerror(errno));
-            return 1;
-        }
-        if (wrmsr(msr_fd, MSR_PKG_POWER_LIMIT, val) != 0) {
-            fprintf(stderr, "write MSR 0x%X failed: %s\n", MSR_PKG_POWER_LIMIT, strerror(errno));
-            close(msr_fd);
-            return 1;
-        }
-        close(msr_fd);
-        printf("OK\n");
-        return 0;
+        return cmd_write_msr(val);
     }
-
+    if (strcmp(argv[1], "--write-mmio") == 0) {
+        if (argc < 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        uint64_t val = 0;
+        if (!parse_u64(argv[2], &val)) {
+            fprintf(stderr, "Invalid value: %s\n", argv[2]);
+            return 2;
+        }
+        return cmd_write_mmio(val);
+    }
     if (strcmp(argv[1], "--write-powercap") == 0) {
         if (argc < 4) {
             usage(argv[0]);
@@ -710,173 +1219,45 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Invalid powercap values.\n");
             return 2;
         }
-        char err[256] = {0};
-        if (write_powercap_uw(pl1_uw, pl2_uw, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to write powercap: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_write_powercap(pl1_uw, pl2_uw);
     }
-
     if (strcmp(argv[1], "--start-thermald") == 0) {
-        const char *services[] = {"thermald.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("start", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to start thermald: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("start", false, "thermald.service");
     }
-
     if (strcmp(argv[1], "--stop-thermald") == 0) {
-        const char *services[] = {"thermald.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("stop", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to stop thermald: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("stop", false, "thermald.service");
     }
-
     if (strcmp(argv[1], "--disable-thermald") == 0) {
-        const char *services[] = {"thermald.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("disable", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to disable thermald: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("disable", false, "thermald.service");
     }
-
     if (strcmp(argv[1], "--enable-thermald") == 0) {
-        const char *services[] = {"thermald.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("enable", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to enable thermald: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("enable", false, "thermald.service");
     }
-
     if (strcmp(argv[1], "--start-tuned") == 0) {
-        const char *services[] = {"tuned.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("start", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to start tuned: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("start", false, "tuned.service");
     }
-
     if (strcmp(argv[1], "--stop-tuned") == 0) {
-        const char *services[] = {"tuned.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("stop", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to stop tuned: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("stop", false, "tuned.service");
     }
-
     if (strcmp(argv[1], "--disable-tuned") == 0) {
-        const char *services[] = {"tuned.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("disable", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to disable tuned: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("disable", false, "tuned.service");
     }
-
     if (strcmp(argv[1], "--enable-tuned") == 0) {
-        const char *services[] = {"tuned.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("enable", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to enable tuned: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("enable", false, "tuned.service");
     }
-
     if (strcmp(argv[1], "--start-tuned-ppd") == 0) {
-        const char *services[] = {"tuned-ppd.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("start", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to start tuned-ppd: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("start", false, "tuned-ppd.service");
     }
-
     if (strcmp(argv[1], "--stop-tuned-ppd") == 0) {
-        const char *services[] = {"tuned-ppd.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("stop", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to stop tuned-ppd: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("stop", false, "tuned-ppd.service");
     }
-
     if (strcmp(argv[1], "--disable-tuned-ppd") == 0) {
-        const char *services[] = {"tuned-ppd.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("disable", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to disable tuned-ppd: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("disable", false, "tuned-ppd.service");
     }
-
     if (strcmp(argv[1], "--enable-tuned-ppd") == 0) {
-        const char *services[] = {"tuned-ppd.service"};
-        char err[256] = {0};
-        if (run_systemctl_action("enable", false, services, 1, err, sizeof(err)) != 0) {
-            fprintf(stderr, "Failed to enable tuned-ppd: %s\n", err[0] ? err : "unknown error");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_service("enable", false, "tuned-ppd.service");
     }
-
-    if (strcmp(argv[1], "--write-mmio") == 0) {
-        if (argc < 3) {
-            usage(argv[0]);
-            return 2;
-        }
-        uint64_t val = 0;
-        if (!parse_u64(argv[2], &val)) {
-            fprintf(stderr, "Invalid value: %s\n", argv[2]);
-            return 2;
-        }
-        volatile uint8_t *mmio = NULL;
-        char mmio_err[256] = {0};
-        int mem_fd = open_mmio(true, &mmio, mmio_err, sizeof(mmio_err));
-        if (mem_fd < 0) {
-            fprintf(stderr, "open MMIO failed: %s\n", mmio_err[0] ? mmio_err : "unknown error");
-            return 1;
-        }
-        wr64(mmio, PL_OFF, val);
-        close_mmio(mem_fd, mmio);
-        printf("OK\n");
-        return 0;
-    }
-
-    if (strcmp(argv[1], "--set-p-ratio") == 0 ||
-        strcmp(argv[1], "--set-e-ratio") == 0 ||
-        strcmp(argv[1], "--set-all-ratio") == 0) {
+    if (strcmp(argv[1], "--set-p-ratio") == 0) {
         if (argc < 3) {
             usage(argv[0]);
             return 2;
@@ -886,60 +1267,32 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Invalid ratio: %s\n", argv[2]);
             return 2;
         }
-
-        struct cpu_list p_list;
-        struct cpu_list e_list;
-        struct cpu_list u_list;
-        cpu_list_init(&p_list);
-        cpu_list_init(&e_list);
-        cpu_list_init(&u_list);
-        if (enumerate_cpus(&p_list, &e_list, &u_list, NULL) != 0) {
-            fprintf(stderr, "Failed to enumerate CPUs\n");
-            cpu_list_free(&p_list);
-            cpu_list_free(&e_list);
-            cpu_list_free(&u_list);
-            return 1;
-        }
-
-        int rc = 0;
-        if (strcmp(argv[1], "--set-p-ratio") == 0) {
-            if (p_list.count == 0) {
-                fprintf(stderr, "No P cores detected\n");
-                rc = 1;
-            } else {
-                rc = apply_ratio_list(&p_list, (uint8_t)ratio);
-            }
-        } else if (strcmp(argv[1], "--set-e-ratio") == 0) {
-            if (e_list.count == 0) {
-                fprintf(stderr, "No E cores detected\n");
-                rc = 1;
-            } else {
-                rc = apply_ratio_list(&e_list, (uint8_t)ratio);
-            }
-        } else {
-            if (apply_ratio_list(&p_list, (uint8_t)ratio) != 0) {
-                rc = 1;
-            }
-            if (apply_ratio_list(&e_list, (uint8_t)ratio) != 0) {
-                rc = 1;
-            }
-            if (apply_ratio_list(&u_list, (uint8_t)ratio) != 0) {
-                rc = 1;
-            }
-        }
-
-        cpu_list_free(&p_list);
-        cpu_list_free(&e_list);
-        cpu_list_free(&u_list);
-
-        if (rc != 0) {
-            fprintf(stderr, "Failed to apply ratio\n");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_set_p_ratio(ratio);
     }
-
+    if (strcmp(argv[1], "--set-e-ratio") == 0) {
+        if (argc < 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        int ratio = 0;
+        if (!parse_int(argv[2], &ratio) || ratio <= 0 || ratio > 255) {
+            fprintf(stderr, "Invalid ratio: %s\n", argv[2]);
+            return 2;
+        }
+        return cmd_set_e_ratio(ratio);
+    }
+    if (strcmp(argv[1], "--set-all-ratio") == 0) {
+        if (argc < 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        int ratio = 0;
+        if (!parse_int(argv[2], &ratio) || ratio <= 0 || ratio > 255) {
+            fprintf(stderr, "Invalid ratio: %s\n", argv[2]);
+            return 2;
+        }
+        return cmd_set_all_ratio(ratio);
+    }
     if (strcmp(argv[1], "--set-pe-ratio") == 0) {
         if (argc < 4) {
             usage(argv[0]);
@@ -952,47 +1305,22 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Invalid ratio values\n");
             return 2;
         }
-
-        struct cpu_list p_list;
-        struct cpu_list e_list;
-        struct cpu_list u_list;
-        cpu_list_init(&p_list);
-        cpu_list_init(&e_list);
-        cpu_list_init(&u_list);
-        if (enumerate_cpus(&p_list, &e_list, &u_list, NULL) != 0) {
-            fprintf(stderr, "Failed to enumerate CPUs\n");
-            cpu_list_free(&p_list);
-            cpu_list_free(&e_list);
-            cpu_list_free(&u_list);
-            return 1;
-        }
-
-        int rc = 0;
-        if (p_list.count == 0) {
-            fprintf(stderr, "No P cores detected\n");
-            rc = 1;
-        } else if (apply_ratio_list(&p_list, (uint8_t)ratio_p) != 0) {
-            rc = 1;
-        }
-        if (e_list.count == 0) {
-            fprintf(stderr, "No E cores detected\n");
-            rc = 1;
-        } else if (apply_ratio_list(&e_list, (uint8_t)ratio_e) != 0) {
-            rc = 1;
-        }
-
-        cpu_list_free(&p_list);
-        cpu_list_free(&e_list);
-        cpu_list_free(&u_list);
-
-        if (rc != 0) {
-            fprintf(stderr, "Failed to apply ratio\n");
-            return 1;
-        }
-        printf("OK\n");
-        return 0;
+        return cmd_set_pe_ratio(ratio_p, ratio_e);
     }
-
+    if (strcmp(argv[1], "--set-cpu-ratio") == 0) {
+        if (argc < 4) {
+            usage(argv[0]);
+            return 2;
+        }
+        int cpu = 0;
+        int ratio = 0;
+        if (!parse_int(argv[2], &cpu) || !parse_int(argv[3], &ratio) ||
+            cpu < 0 || ratio <= 0 || ratio > 255) {
+            fprintf(stderr, "Invalid cpu or ratio values\n");
+            return 2;
+        }
+        return cmd_set_cpu_ratio(cpu, ratio);
+    }
     if (strcmp(argv[1], "--set-core-uv") == 0) {
         if (argc < 3) {
             usage(argv[0]);
@@ -1003,27 +1331,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Invalid voltage offset: %s\n", argv[2]);
             return 2;
         }
-        if (mv < -500.0 || mv > 500.0) {
-            fprintf(stderr, "Refusing voltage offset outside [-500, 500] mV.\n");
-            return 2;
-        }
-
-        int msr_fd = open_msr(true);
-        if (msr_fd < 0) {
-            fprintf(stderr, "open(/dev/cpu/0/msr) failed: %s\n", strerror(errno));
-            return 1;
-        }
-
-        uint32_t raw = oc_encode_offset_mv(mv);
-        if (oc_mailbox_write(msr_fd, OC_PLANE_CORE, raw) != 0) {
-            fprintf(stderr, "write OC mailbox failed: %s\n", strerror(errno));
-            close(msr_fd);
-            return 1;
-        }
-
-        close(msr_fd);
-        printf("OK\n");
-        return 0;
+        return cmd_set_core_uv(mv);
+    }
+    if (strcmp(argv[1], "--read-core-sensors") == 0) {
+        return cmd_read_core_sensors();
     }
 
     usage(argv[0]);

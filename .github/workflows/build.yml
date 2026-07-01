@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            qt6-base-dev \
+            qt6-base-dev-tools
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Smoke test binaries
+        run: |
+          for bin in build/mchbar_read build/mchbar_pl_write build/mchbar_scan build/limits_ui build/limits_helper build/limits_ui_qt; do
+            test -x "$bin" || { echo "Missing or not executable: $bin"; exit 1; }
+          done
+          echo "All binaries built successfully."
+
+  build-fedora:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps (Fedora)
+        run: |
+          dnf -y update
+          dnf -y install \
+            gcc \
+            gcc-c++ \
+            make \
+            cmake \
+            qt6-qtbase-devel
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Smoke test binaries
+        run: |
+          for bin in build/mchbar_read build/mchbar_pl_write build/mchbar_scan build/limits_ui build/limits_helper build/limits_ui_qt; do
+            test -x "$bin" || { echo "Missing or not executable: $bin"; exit 1; }
+          done
+          echo "All binaries built successfully."

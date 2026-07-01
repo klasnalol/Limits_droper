@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect x="4" y="4" width="248" height="248" rx="32" fill="#2d2d2d"/>
+  <text x="128" y="166" font-family="sans-serif" font-weight="bold" font-size="128" fill="white" text-anchor="middle" dominant-baseline="alphabetic">TDP</text>
+  <line x1="44" y1="212" x2="212" y2="44" stroke="#eb3c3c" stroke-width="24" stroke-linecap="round"/>
+</svg>

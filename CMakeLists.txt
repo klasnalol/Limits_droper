@@ -7,8 +7,14 @@ add_executable(mchbar_read mchbar_read.c)
 
 add_executable(mchbar_pl_write mchbar_pl_write.c)
 
+add_executable(mchbar_scan mchbar_scan.c)
+target_link_libraries(mchbar_scan m)
+
 add_executable(limits_ui limits_ui.c)
 target_link_libraries(limits_ui m)
+
+add_executable(limits_helper helper/limits_helper.c)
+target_link_libraries(limits_helper m)
 
 find_package(Qt6 COMPONENTS Widgets QUIET)
 find_package(Qt5 COMPONENTS Widgets QUIET)
@@ -36,4 +42,10 @@ if (BUILD_QT)
     )
     target_link_libraries(limits_ui_qt PRIVATE ${QT_LIBS})
 endif()
+
+# Copy assets next to the build outputs so they are easy to install/package.
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/assets/limits_droper.svg
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/assets)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/assets/limits_droper.desktop
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/assets)
 

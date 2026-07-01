@@ -20,8 +20,10 @@ This project was made to bypass enforced power limits on a specific test setup b
 - Read/write PL1/PL2 in watts (MSR 0x610 and MCHBAR 0x59A0).
 - Sync MSR <-> MMIO power limit values.
 - P-core / E-core ratio targets (IA32_PERF_CTL 0x199) with current ratio display (IA32_PERF_STATUS 0x198).
+- Per-core ratio targets in the GUI.
 - Core voltage offset (OC mailbox MSR 0x150, core plane).
 - Basic CPU info panel in the GUI (model, microcode, core counts, P/E MHz).
+- Sensors tab with per-core clock, temperature, current ratio, and throttle status. Sensors only read while the tab is visible to keep overhead low.
 - GUI profile save/load (JSON) with optional startup auto-apply and crash-guard fallback.
 
 ## Requirements
@@ -79,10 +81,17 @@ cd Limits_droper-<version>-linux-<distro>
 sudo install -m 0755 limits_helper /usr/local/bin/limits_helper
 sudo install -m 0644 com.limits_droper.helper.policy /usr/share/polkit-1/actions/
 ```
-4) Run the GUI:
+4) Optional: install the app icon and launcher entry so the tray/window icon shows up in your desktop environment:
+```bash
+sudo install -Dm644 assets/limits_droper.svg /usr/share/icons/hicolor/scalable/apps/limits_droper.svg
+sudo install -Dm644 assets/limits_droper.desktop /usr/share/applications/limits_droper.desktop
+# Update the .desktop Exec path if you did not install limits_ui_qt to /usr/local/bin
+```
+5) Run the GUI:
 ```bash
 ./limits_ui_qt
 ```
+The GUI can be set to start automatically on login from **Profiles + startup → Start automatically on login**.
 
 ### From source
 
@@ -158,6 +167,21 @@ sudo ./build/limits_helper --enable-tuned-ppd
 ```
 `--start-*` / `--stop-*` change runtime state now. `--enable-*` / `--disable-*` only change boot persistence.
 
+Read per-core sensor data (current ratio and thermal status per logical CPU):
+```bash
+sudo ./build/limits_helper --read-core-sensors
+```
+
+Set a per-core ratio target on a specific logical CPU:
+```bash
+sudo ./build/limits_helper --set-cpu-ratio 0 45
+```
+
+Run the helper in persistent server mode (used internally by the GUI to avoid repeated `pkexec` prompts):
+```bash
+sudo ./build/limits_helper --server
+```
+
 Interactive UI (read/set/sync MSR + MMIO):
 ```bash
 sudo build/limits_ui
@@ -169,6 +193,18 @@ Qt UI:
 ```
 If you `cd qt_ui` first, run `./build/limits_ui_qt`.
 The GUI uses polkit via `pkexec`, so it should be run as your user (no `sudo`). You can override the helper path with `LIMITS_HELPER_PATH`.
+
+Authentication behavior:
+- On startup the GUI refreshes the current limits/state, which starts a single persistent helper via `pkexec` and prompts for a password once.
+- After that authentication, all reads/writes reuse the same helper process, so sensor updates and further actions do not re-prompt.
+- If you cancel the polkit dialog, the action fails but the app stays open. Retry the action to authenticate.
+
+When the Qt GUI is running it shows a "TDP" crossed-out icon in the system tray. Closing the window hides the app to the tray; use the tray menu or Quit to exit completely. You can disable this in **Profiles + startup → Close to system tray**.
+
+The GUI is organized into two tabs:
+- **Main** — CPU info, status, power limit controls, P/E and per-core ratios, voltage offset, sync, services, profiles, and log.
+- **Sensors** — per-core clock, temperature, current ratio, and throttle flags. The Sensors tab only reads hardware while it is visible, so background CPU usage stays minimal.
+
 Profiles + startup:
 - Use "Save Profile" / "Load Profile" to store JSON profiles with PL1/PL2, ratios, and core UV.
 - Enable "Apply on startup" to auto-apply the selected profile. If the previous auto-apply did not finish (crash/lockup), startup auto-apply is disabled and an optional fallback profile can be applied instead.
@@ -179,6 +215,8 @@ Profiles + startup:
 - MSR power unit is taken from `IA32_RAPL_POWER_UNIT` (0x606) and applied when converting watts.
 - Power limits are written to `IA32_PKG_POWER_LIMIT` (0x610) and/or MCHBAR 0x59A0.
 - Ratio targets are shown from `IA32_PERF_CTL` (0x199); current ratios are read from `IA32_PERF_STATUS` (0x198).
+- Per-core ratios are written via `IA32_PERF_CTL` on each logical CPU.
+- Per-core thermal/throttle status in the Sensors tab is read from `IA32_THERM_STATUS` (0x19C).
 - P/E detection uses CPUID leaf 0x1A core type when available.
 - Core voltage offset uses the OC mailbox (MSR 0x150) with a core-plane offset (mV). Use with caution.
 - Tested only on ES i7-13700HX (Q1K3) on PRIME B660M-K D4, used to bypass 55W and 157W limits. Other CPUs/boards may differ.

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Limits Droper
+Comment=Adjust Intel CPU power limits (PL1/PL2), ratios, and voltage offset
+Exec=/usr/local/bin/limits_ui_qt
+Icon=limits_droper
+Type=Application
+Terminal=false
+Categories=System;Settings;
+StartupNotify=true
